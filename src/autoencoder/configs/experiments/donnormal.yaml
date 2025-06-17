@@ -1,0 +1,9 @@
+__object__:
+  path: models
+  name: TimeInputHelper
+  args: as_config
+
+ticlass: DeepONet
+branchseq: [1, 400, 400, 400, 50]
+trunkseq: [2, 400, 400, 400, 50]
+activation: relu

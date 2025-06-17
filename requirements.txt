@@ -1,0 +1,14 @@
+
+scikit-dimension
+torch
+torchvision
+torchaudio
+numpy
+scikit-learn
+ipywidgets
+matplotlib
+pandas
+seaborn
+deepxde
+ipympl
+omegaconf
