@@ -6,8 +6,8 @@ __object__:
 windows: 10
 aeclass: FFVAE
 aeparams:
-  encodeSeq: [1, 500, 500, 4]
-  decodeSeq: [4, 500, 500, 1]
+  encodeSeq: [1, 500, 500, 500, 4]
+  decodeSeq: [4, 500, 500, 500, 1]
   activation: relu
   reg: 0.1
 

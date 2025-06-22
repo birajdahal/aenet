@@ -10,6 +10,6 @@ file:
 datasize:
   subset: 500
   space: 512
-  time: 51
+  time: 201
   scaledown: True
   spacedim: 1

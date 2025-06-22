@@ -47,7 +47,7 @@ class wrapper_PyWLaSDI():
         
 
     def configure_dataset(self):
-        data_path = "../../datasets/burgers/grfarc2visc0p001-shift.mat"
+        data_path = "datasets/burgers/grfarc2visc0p001-shift.mat"
         data_var = "grfarc2visc0p001"
         # data_path = self.config.file.filestr
         # data_var = self.config.file.dataname
@@ -114,7 +114,7 @@ class wrapper_PyWLaSDI():
         if hasattr(self, "skip_training") and self.skip_training:
             return 
         batch_size = 20
-        num_epochs = 1000
+        num_epochs = 2
         num_epochs_print = num_epochs//100
         early_stop_patience = num_epochs//10
 
@@ -150,19 +150,37 @@ class wrapper_PyWLaSDI():
         self.WLaSDI_model_coef = self.WLaSDI_model.train_dynamics(self.latent_space_SS, self.Ptrain, self.t, degree = degree, gamma = 0.1, threshold=0, overlap=0.7, L = 30, LS_vis=True)
         print(f"weak latent sindy coefficietns {self.WLaSDI_model_coef}")
 
+    # def validation(self):
+    #     for i in range(1):
+    #         test_traj = self.testset[i]
+    #         P = self.Ptest[i]
+    #         self.validate_step(test_traj, P)
     def validation(self):
-        for i in range(1):
-            test_traj = self.testset[i]
-            P = self.Ptest[i]
-            self.validate_step(test_traj, P)
+        """
+        Reconstruct every trajectory in the test set,
+        stash them in self.predicted_array, and save to disk.
+        """
+        reconstructions = []                          # <- start empty list
+
+        for test_traj, P in zip(self.testset, self.Ptest):
+            FOM_recon = self.validate_step(test_traj, P)
+            reconstructions.append(FOM_recon)         # <- accumulate
+
+        # Shape:  (n_test, nt, nx)
+        self.predicted_array = np.stack(reconstructions, axis=0)
+
+        scipy.io.savemat("predicted_array.mat",
+                        {"predicted_array": self.predicted_array})
+
         
     def validate_step(self, snapshot_full_FOM, P):
         start = time.time()
         FOM_recon = self.WLaSDI_model.generate_ROM(snapshot_full_FOM[0], P, self.t)
         WLaSDI_time = time.time()-start
-        self.plot_final_position_error(FOM_recon, snapshot_full_FOM)
-        self.plot_relative_error(FOM_recon, snapshot_full_FOM)
-        
+        #self.plot_final_position_error(FOM_recon, snapshot_full_FOM)
+        #self.plot_relative_error(FOM_recon, snapshot_full_FOM)
+        return FOM_recon  
+
     def plot_final_position_error(self, FOM_recon, snapshot_full_FOM):
         print('Final Position Error: {:.3}%'.format(LA.norm(FOM_recon[-1]-snapshot_full_FOM[-1])/LA.norm(snapshot_full_FOM[-1])*100))
         fig = plt.figure()

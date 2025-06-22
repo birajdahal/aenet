@@ -4,12 +4,12 @@ __object__:
   args: as_config
 
 file:
-  filestr: "../../datasets/transport/hats2_2500_shift.mat"
+  filestr: "../../datasets/transport/hatsshift_2500"
   dataname: "alldata"
   name: "tshift"
 datasize:
   subset: 500
   space: 512
-  time: 51
+  time: 201
   scaledown: True
   spacedim: 1

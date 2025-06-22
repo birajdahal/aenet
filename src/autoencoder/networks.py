@@ -91,7 +91,7 @@ class ConvAutoEncoder(AutoEncoder):
         padding_mode = config.downblocks.get("padding_mode", 'zeros')
         self.dim = 1 if not (isinstance(in_dims, list) or isinstance(in_dims, ListConfig)) else len(in_dims)
         
-        mlp = config.get("mlp", True)
+        mlp = config.get("mlp", False)
 
         self.encoder = ConvEncoder(
             in_dims=in_dims, 

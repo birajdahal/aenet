@@ -19,14 +19,14 @@ def generate_hat_manifold(num, xrange=[0, 1], h_range=[0, 3], alpha_range=[1, 10
     x = np.expand_dims(np.linspace(xrange[0], xrange[1], 1024), axis=1)
     return np.transpose(combined_hat(x, hvals, avals, bvals))
 
-def generate_hat_data(num, randomt=False, trange=[0, 0.3], xrange=[0, 1], h_range=[0, 1], alpha_range=[1, 4], beta_range=[1, 4], res=1024, params=True):
-    hvals = h_range[0] + (0*np.random.rand(num)) * (h_range[1] - h_range[0])
-    avals = alpha_range[0] + (np.random.rand(num)) * (alpha_range[1] - alpha_range[0]) # dim 1
-    bvals = beta_range[0] + (0 * (np.random.rand(num)) + 0.5) * (beta_range[1] - beta_range[0]) # dim 2
+def generate_hat_data(num, randomt=False, trange=[0, 0.3], xrange=[0, 1], h_range=[0, 3], alpha_range=[1, 4], beta_range=[1, 4], res=1024, params=True):
+    hvals = h_range[0] + (np.random.rand(num)) * (h_range[1] - h_range[0])
+    avals = alpha_range[0] + (0*np.random.rand(num)) * (alpha_range[1] - alpha_range[0]) # dim 1
+    bvals = beta_range[0] + (0 * (np.random.rand(num))) * (beta_range[1] - beta_range[0]) # dim 2
 
     x = np.expand_dims(np.linspace(xrange[0], xrange[1], res), axis=1)
     
-    numt = 301
+    numt = 201
     alldata = np.zeros((num, numt, res))
 
     if not randomt:
@@ -46,6 +46,6 @@ def generate_hat_data(num, randomt=False, trange=[0, 0.3], xrange=[0, 1], h_rang
 
 alldata, params = generate_hat_data(2500, res=512, randomt=False)
 
-scipy.io.savemat("hatsscale_2500_long.mat", {'alldata': alldata, 'params': params})
+scipy.io.savemat("hatsshift_2500.mat", {'alldata': alldata, 'params': params})
 
 print(params.shape)

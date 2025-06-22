@@ -161,6 +161,8 @@ def trainAE( encoder,
       print("")
       print('Re-start {}th training... m={}, f={}, M1={}, M2={}'.format(
             last_epoch+1, encoder.m, encoder.f, encoder.M, decoder.M))
+
+      epoch = last_epoch
   except:
       optimizer = torch.optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr=0.001)
       scheduler = lr_scheduler.ReduceLROnPlateau(optimizer,patience=10) 

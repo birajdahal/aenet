@@ -89,7 +89,7 @@ class FCDecoder(coder):
 
 
 class ConvEncoder(coder):
-    def __init__(self, in_dims, latents_dims, out_channels, kernel_stride_paddings, actvn=nn.ReLU(), in_channel=1, padding_mode="zeros", mlp=True, **kwargs):
+    def __init__(self, in_dims, latents_dims, out_channels, kernel_stride_paddings, actvn=nn.ReLU(), in_channel=1, padding_mode="zeros", mlp=False, **kwargs):
         super().__init__()
         in_dims = self.configure_dims(in_dims)
         self.configure_conv_dims(in_dims, kernel_stride_paddings)
@@ -132,7 +132,7 @@ class ConvEncoder(coder):
 
 
 class ConvDecoder(coder):
-    def __init__(self, out_dims, latents_dims, in_channels, kernel_stride_paddings, actvn=nn.ReLU(), out_channel=1, uncond=True, padding_mode="zeros", mlp=True, **kwargs):
+    def __init__(self, out_dims, latents_dims, in_channels, kernel_stride_paddings, actvn=nn.ReLU(), out_channel=1, uncond=True, padding_mode="zeros", mlp=False, **kwargs):
         super().__init__()
         if not uncond:
             latents_dims += 1

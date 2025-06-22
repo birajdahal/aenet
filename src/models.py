@@ -40,28 +40,6 @@ def get_activation(activation):
   else:
     return nn.ReLU()
 
-def get_proj_errors(model, testarr, ords=(2,)):
-  if isinstance(testarr, np.ndarray):
-    testarr = torch.tensor(testarr, dtype=torch.float32)
-    
-  proj = model(testarr)
-  
-  if len(testarr.shape) > 3:
-    assert(len(testarr.shape) == 4)
-    testarr = testarr.reshape(list(testarr.shape[:-2]) + [-1])
-    proj = proj.reshape(list(proj.shape[:-2]) + [-1])
-
-  n = testarr.shape[0]
-  testarr = testarr.cpu().detach().numpy().reshape([n, -1])
-  proj = proj.cpu().detach().numpy().reshape([n, -1])
-
-  testerrs = []
-  for o in ords:
-    testerro = np.mean(np.linalg.norm(testarr - proj, axis=1, ord=o) / np.linalg.norm(testarr, axis=1, ord=o))
-    testerrs.append(testerro)
-
-  return tuple(testerrs)
-
 def determine_param(dataset, encoding_param):
   if encoding_param == -1:
     encoding_param = []
@@ -207,82 +185,84 @@ class FFAutoencoder(nn.Module):
             pickle.dump({"model": self}, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 class FFVAE(nn.Module):
-  def __init__(self, encodeSeq, decodeSeq, activation=nn.ReLU(), datadim=1, reg=0.1):
-    super().__init__()
-    self.activation = activation
-    self.datadim = datadim
-    self.reg = reg
+    def __init__(self, encodeSeq, decodeSeq, activation=nn.ReLU(), datadim=1, reg=0.1):
+      super().__init__()
+      self.activation = activation
+      self.datadim = datadim
+      self.reg = reg
 
-    es = list(encodeSeq)
-    self.latentdim = es[-1]
-    es[-1] = 2*es[-1]
+      es = list(encodeSeq)
+      self.latentdim = es[-1]
+      es[-1] = 2*es[-1]
 
-    self.encoder_net = FFNet(seq=es, activation=activation)
+      self.reduced = self.latentdim
 
-    self.decoder_net = FFNet(seq=decodeSeq, activation=activation)
+      self.encoder_net = FFNet(seq=es, activation=activation)
 
-  def encode(self, x, variance=False):
-    if self.datadim == 2:
-      batch = x.size(0)
-      x = x.view(batch, -1)
+      self.decoder_net = FFNet(seq=decodeSeq, activation=activation)
 
-    h = self.encoder_net(x)
-    mu = h[..., :self.latentdim]
-    logvar =  h[..., self.latentdim:]
+    def encode(self, x, variance=False):
+      if self.datadim == 2:
+        batch = x.size(0)
+        x = x.view(batch, -1)
 
-    if variance:
-        return mu, logvar
-    else:
-        return mu
+      h = self.encoder_net(x)
+      mu = h[..., :self.latentdim]
+      logvar =  h[..., self.latentdim:]
 
-  def reparameterize(self, mu, logvar):
-    std = torch.exp(0.5 * logvar)
-    eps = torch.randn_like(std)
-    return mu + eps * std
+      if variance:
+          return mu, logvar
+      else:
+          return mu
 
-  def decode(self, z):
-    recon_flat = self.decoder_net(z)
+    def reparameterize(self, mu, logvar):
+      std = torch.exp(0.5 * logvar)
+      eps = torch.randn_like(std)
+      return mu + eps * std
 
-    if self.datadim == 2:
-      side = int(np.sqrt(self.input_dim))
-      recon = recon_flat.view(-1, side, side)
-      return recon
+    def decode(self, z):
+      recon_flat = self.decoder_net(z)
 
-    return recon_flat
-
-  def forward(self, x, variance=False):
-    mu, logvar = self.encode(x, variance=True)
-    z = self.reparameterize(mu, logvar)
-    recon = self.decode(z)
-
-    if variance:
-        return recon, mu, logvar
-    else:
+      if self.datadim == 2:
+        side = int(np.sqrt(self.input_dim))
+        recon = recon_flat.view(-1, side, side)
         return recon
 
-  def loss_function(self, recon, x, mu, logvar):
-    if self.datadim == 2:
-      batch = x.size(0)
-      x_flat = x.view(batch, -1)
-    else:
-      x_flat = x
+      return recon_flat
 
-    recon_flat = recon.view_as(x_flat)
-    recon_loss = nn.MSELoss()(recon_flat, x_flat)
+    def forward(self, x, variance=False):
+      mu, logvar = self.encode(x, variance=True)
+      z = self.reparameterize(mu, logvar)
+      recon = self.decode(z)
 
-    sigma2 = torch.exp(logvar)
-    kld_element = mu.pow(2) + sigma2 - 1 - logvar
-    kld = 0.5 * torch.sum(kld_element)    
-    kld = kld / x.size(0)
+      if variance:
+          return recon, mu, logvar
+      else:
+          return recon
 
-    return recon_loss + self.reg * kld
+    def loss_function(self, recon, x, mu, logvar):
+      if self.datadim == 2:
+        batch = x.size(0)
+        x_flat = x.view(batch, -1)
+      else:
+        x_flat = x
 
-  def save_model(self, filename):
-    addr = os.path.join(BASEDIR, filename)
-    os.makedirs(os.path.dirname(addr), exist_ok=True)
+      recon_flat = recon.view_as(x_flat)
+      recon_loss = nn.MSELoss()(recon_flat, x_flat)
 
-    with open(addr, "wb") as handle:
-      pickle.dump({"model": self}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+      sigma2 = torch.exp(logvar)
+      kld_element = mu.pow(2) + sigma2 - 1 - logvar
+      kld = 0.5 * torch.sum(kld_element)    
+      kld = (kld / x.size(0)) / recon_flat.shape[1]
+
+      return (recon_loss, kld * self.reg)
+
+    def save_model(self, filename):
+      addr = os.path.join(BASEDIR, filename)
+      os.makedirs(os.path.dirname(addr), exist_ok=True)
+
+      with open(addr, "wb") as handle:
+        pickle.dump({"model": self}, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 class GIAutoencoder(nn.Module):
     def __init__(self, encodeSeq, decodeSeq, domaingrid, activation, decoderActivation=None, enforcetime=False, rangedim=1, ffeatures=1, datadim=1):
@@ -486,7 +466,7 @@ class WindowTrajectory():
     return self.decode_window(w, self.encode_window(w, tensor))
 
   def encode_window(self, w, tensor):
-    return self.aes[w].encode(tensor)
+    return self.encode_model(self.aes[w], tensor)
 
 class TimeInputModel():
   def __init__(self, dataset, ticlass, tiinfo, activation, td, seed, device):
@@ -783,7 +763,7 @@ class TimeInputModel():
     return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf }
 
 class WeldNet(WindowTrajectory):
-  def __init__(self, dataset, windows, aeclass, aeparams, propclass, propparams, transclass, transparams, straightness=0, td=None, seed=0, device=0, kinetic=0, decodedprop=False, accumulateprop=False, autonomous=True):    
+  def __init__(self, dataset, windows, aeclass, aeparams, propclass, propparams, transclass, transparams, passparams=False, straightness=0, td=None, seed=0, device=0, kinetic=0, decodedprop=False, accumulateprop=False, autonomous=True):    
     self.dataset = dataset
     self.device = device
     self.td = td
@@ -797,12 +777,28 @@ class WeldNet(WindowTrajectory):
     self.kinetic = kinetic
     self.autonomous = autonomous
     self.residualprop = True
+
     self.accumulateprop = accumulateprop
+    assert(not accumulateprop)
+    assert(autonomous)
+
     self.decodedprop = decodedprop
 
+    self.passparams = passparams
+
     if not self.autonomous:
-        propparams["seq"] = list(propparams["seq"])
-        propparams["seq"][0] = propparams["seq"][-1] + 1
+      propparams["seq"] = list(propparams["seq"])
+      propparams["seq"][0] = propparams["seq"][-1] + 1
+
+    if self.passparams:
+      propparams["seq"] = list(propparams["seq"])
+      propparams["seq"][0] = propparams["seq"][0] + 1
+
+      transparams["seq"] = list(transparams["seq"])
+      transparams["seq"][0] = transparams["seq"][0] + 1
+
+      aeparams["decodeSeq"] = list(aeparams["decodeSeq"])
+      aeparams["decodeSeq"][0] = aeparams["decodeSeq"][0] + 1
 
     assert(self.straightness == 0 or self.kinetic == 0)
 
@@ -824,6 +820,18 @@ class WeldNet(WindowTrajectory):
 
     self.alltrain = datacopy[:self.numtrain]
     self.alltest = datacopy[self.numtrain:]
+
+    self.paramtrain = self.dataset.params[:self.numtrain]
+    self.paramtest = self.dataset.params[self.numtrain:]
+
+    if self.passparams:
+      T = self.alltrain.shape[1] 
+      
+      paramtrain = np.repeat(self.paramtrain[:, None, :], T, axis=1)
+      paramtest  = np.repeat(self.paramtest[:, None, :], T, axis=1) 
+
+      self.alltrain = np.concatenate([self.alltrain, paramtrain], axis=-1)
+      self.alltest = np.concatenate([self.alltest, paramtest], axis=-1)
 
     aeparams["datadim"] = len(self.dataset.data.shape) - 2
     self.aedata = [aeclass.__name__, aeparams, windows, self.straightness, self.kinetic]
@@ -867,6 +875,9 @@ class WeldNet(WindowTrajectory):
       "seed": seed,
       "epochs": [],
     }
+
+    if self.passparams:
+      self.metadata["passparams"] = True
   
   def transcode(self, t, codes):
     w = self.find_window(t)
@@ -932,23 +943,10 @@ class WeldNet(WindowTrajectory):
         ttensor = torch.tensor(np.repeat((tcurr*0 - 1), codes.shape[0])).unsqueeze(1).to(self.device).float()
         codeinput = torch.cat((codes, ttensor), dim=1)
 
-      if isinstance(self.props[wcurr], nn.Module):
-        modelout = self.props[wcurr].forward(codeinput)
-      else:
-        if torch.is_tensor(codes):
-          codes = codes.detach().cpu().numpy()
-
-        ttensor = np.full((codes.shape[0], 1), tcurr - 1, dtype=np.float32) 
-        codeinput = np.concatenate([codes, ttensor], axis=1)
-        modelout = self.props[w].predict(codeinput)
-
-      if self.residualprop:
-        codes = codes + modelout
-      else:
-        codes = modelout
+      codes = self.prop_forward(self.props[wcurr], codeinput)
 
       wprev = wcurr
-      codeslist.append(torch.tensor(codes, dtype=torch.float32, device=self.device))
+      codeslist.append(codes)
 
     return codeslist
 
@@ -1096,6 +1094,73 @@ class WeldNet(WindowTrajectory):
     print(matching_files)
     return False
 
+  def get_proj_errors(self, model, testarr, ords=(2,)):
+    if isinstance(testarr, np.ndarray):
+      testarr = torch.tensor(testarr, dtype=torch.float32)
+      
+    proj = model.decode(self.encode_model(model, testarr))
+    
+    if len(testarr.shape) > 3:
+      assert(len(testarr.shape) == 4)
+      testarr = testarr.reshape(list(testarr.shape[:-2]) + [-1])
+      proj = proj.reshape(list(proj.shape[:-2]) + [-1])
+
+    if self.passparams:
+      testarr = testarr[..., :-self.dataset.params.shape[1]]
+   
+    n = testarr.shape[0]
+    testarr = testarr.cpu().detach().numpy().reshape([n, -1])
+    proj = proj.cpu().detach().numpy().reshape([n, -1])
+
+    testerrs = []
+
+    for o in ords:
+      testerro = np.mean(np.linalg.norm(testarr - proj, axis=1, ord=o) / np.linalg.norm(testarr, axis=1, ord=o))
+      testerrs.append(testerro)
+
+    return tuple(testerrs)
+
+  def encode_model(self, model, batchh):
+    if self.passparams:
+      batch = batchh[..., :-self.dataset.params.shape[1]]
+      params = batchh[..., -self.dataset.params.shape[1]:]
+    else:
+      batch = batchh
+
+    out = model.encode(batch)
+
+    if self.passparams:
+      out = torch.cat([out, params], dim=-1)
+
+    return out
+
+  def prop_forward(self, prop, batch):
+    batchbase = batch
+    if self.passparams:
+      params = batch[..., -self.dataset.params.shape[1]:]
+      batchbase = batch[..., :-self.dataset.params.shape[1]]
+
+    out = prop.forward(batch)
+
+    if self.residualprop:
+      out = out + batchbase
+
+    if self.passparams:
+      out = torch.cat([out, params], dim=-1)
+
+    return out
+
+  def trans_forward(self, trans, batch):
+    if self.passparams:
+      params = batch[..., -self.dataset.params.shape[1]:]
+
+    out = trans.forward(batch)
+
+    if self.passparams:
+      out = torch.cat([out, params], dim=-1)
+
+    return prop(batch)
+
   def train_aes(self, epochs_first, warmstart_epochs=0, save=True, onlydecoder=False, optim=torch.optim.AdamW, lr=1e-4, plottb=False, gridbatch=None, printinterval=10, batch=32, ridge=0, loss=None, encoding_param=-1, best=True, verbose=False):    
       def ae_epoch(model, dataloader, writer=None, optimizer=None, scheduler=None, ep=0, printinterval=10, loss=None, testarr=None):
         losses = []
@@ -1154,11 +1219,13 @@ class WeldNet(WindowTrajectory):
 
           if isinstance(model, FFVAE):
             recon, mu, logvar = model(batch, variance=True)
-            res = model.loss_function(recon, batch, mu, logvar)
+            self.reconerr, self.kld = model.loss_function(recon, batch, mu, logvar)
+
+            res = self.reconerr + self.kld
             res.backward()
-              
+            
           else:
-            enc = model.encode(batch)
+            enc = self.encode_model(model, batch)
 
             if isinstance(model, GIAutoencoder) or isinstance(model, TCAutoencoder):
               full_grid = model.domaingrid
@@ -1175,8 +1242,10 @@ class WeldNet(WindowTrajectory):
               proj = model.decode(enc, grid=grid_subset)
 
             else:
-              enc = model.encode(batch)
               proj = model.decode(enc)
+
+            if self.passparams:
+              batch = batch[..., :-self.dataset.params.shape[1]]
 
             res = loss(batch, proj)
             res.backward()
@@ -1197,11 +1266,17 @@ class WeldNet(WindowTrajectory):
 
         # print test
         if printinterval > 0 and (ep % printinterval == 0):
-          testerr1, testerr2, testerrinf = get_proj_errors(model, testarr, ords=(1, 2, np.inf))
+          testerr1, testerr2, testerrinf = self.get_proj_errors(model, testarr, ords=(1, 2, np.inf))
+
+          if isinstance(model, FFVAE):
+            prefix = f"{ep+1}: Train Loss {self.reconerr:.3e} + {self.kld:.3e}"
+          else:    
+            prefix = f"{ep+1}: Train Loss {error:.3e}"
+
           if scheduler is not None:
-            print(f"{ep+1}: Train Loss {error:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+            print(f"{prefix}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
           else:
-            print(f"{ep+1}: Train Loss {error:.3e}, Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+            print(f"{prefix}, Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
 
           
           if writer is not None:
@@ -1221,7 +1296,7 @@ class WeldNet(WindowTrajectory):
       self.tests = []
       for w in range(self.W):
         if len(self.aes) <= w:
-          self.aes.append(self.aeclass(**self.aeparams) if self.aeclass not in JC_MODULES else aeclass(aeparams.copy()))
+          self.aes.append(self.aeclass(**self.aeparams) if self.aeclass not in JC_MODULES else self.aeclass(self.aeparams.copy()))
 
         ae = self.aes[w]
 
@@ -1230,12 +1305,12 @@ class WeldNet(WindowTrajectory):
 
         self.aestep = 0
         epochs = epochs_first
-        train = torch.tensor(self.alltrain[:, self.windowvals[w], :], dtype=torch.float32)
-        test = self.alltest[:, self.windowvals[w], :] 
+        train = torch.tensor(self.alltrain[:, self.windowvals[w]], dtype=torch.float32)
+        test = self.alltest[:, self.windowvals[w]]
 
         if isinstance(ae, PCAAutoencoder):
           ae.train_pca(train.cpu().numpy())
-          testerr1, testerr2, testerrinf = get_proj_errors(ae, test, ords=(1, 2, np.inf))
+          testerr1, testerr2, testerrinf = self.get_proj_errors(ae, test, ords=(1, 2, np.inf))
           print(f"Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
 
           continue
@@ -1331,7 +1406,7 @@ class WeldNet(WindowTrajectory):
 
         assert(self.straightness + self.kinetic == 0)
 
-        enc = model.encode(batch)
+        enc = self.encode_model(model, batch)
 
         if isinstance(model, GIAutoencoder) or isinstance(model, TCAutoencoder):
           full_grid = model.domaingrid
@@ -1348,8 +1423,10 @@ class WeldNet(WindowTrajectory):
           proj = model.decode(enc, grid=grid_subset)
           
         else:
-          enc = model.encode(batch)
           proj = model.decode(enc)
+
+        if self.passparams:
+          batch = batch[..., :-self.dataset.params.shape[1]]
 
         self.res = loss(batch, proj)
 
@@ -1384,7 +1461,7 @@ class WeldNet(WindowTrajectory):
 
       # print test
       if printinterval > 0 and (ep % printinterval == 0):
-        testerr1, testerr2, testerrinf = get_proj_errors(model, testarr, ords=(1, 2, np.inf))
+        testerr1, testerr2, testerrinf = self.get_proj_errors(model, testarr, ords=(1, 2, np.inf))
 
         if scheduler is not None:
           print(f"{ep+1}: Train Loss {self.res:.3e} + {self.error:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
@@ -1425,7 +1502,7 @@ class WeldNet(WindowTrajectory):
 
       if isinstance(ae, PCAAutoencoder):
         ae.train_pca(train.cpu().numpy())
-        testerr1, testerr2, testerrinf = get_proj_errors(ae, test, ords=(1, 2, np.inf))
+        testerr1, testerr2, testerrinf = self.get_proj_errors(ae, test, ords=(1, 2, np.inf))
         print(f"Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
 
         continue
@@ -1493,130 +1570,7 @@ class WeldNet(WindowTrajectory):
     print("Finished training all timewindows")
     return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf } 
 
-  def train_aes_alternate_props(self, epochs, lamb=0.1, save=True, optim=torch.optim.AdamW, lr=1e-4, plottb=False, gridbatch=None, printinterval=10, batch=32, ridge=0, loss=None, encoding_param=-1, best=True, verbose=False):
-    def train_epoch_ae(ep):
-      ae.train()
-      running = []
-      for batch_idx, batch in enumerate(dataloader):
-        opt_ae.zero_grad()
-        enc = ae.encode(batch)
-
-        if gridbatch:
-          full = ae.domaingrid
-          idx  = torch.randperm(full.shape[0], device=full.device)[:gridbatch]
-          recon = ae.decode(enc, grid=full[idx])
-        else:
-          recon = ae.decode(enc)
-
-        loss_ae = recon_loss_fn(batch, recon)
-        loss_ae.backward()
-        opt_ae.step()
-        running.append(loss_ae.item())
-
-        if writer and (batch_idx + ep*len(dataloader)) % 5 == 0:
-          writer.add_scalar("AE/loss", loss_ae.item(), ep*len(dataloader)+batch_idx)
-
-      scheduler_ae.step(np.mean(running))
-      return np.mean(running)
-
-    def train_epoch_prop(ep):
-      ae.eval()
-      prop.train()
-      running = []
-      for batch_idx, batch in enumerate(dataloader):
-        with torch.no_grad(): 
-          enc = ae.encode(batch)
-
-        starts = enc[:, :-1]
-        targets = enc[:, 1:]
-        opt_prop.zero_grad()
-        pred = prop(starts)
-        if self.residualprop: pred = starts + pred
-        loss_p = prop_loss_fn(pred, targets)
-        loss_p.backward()
-        opt_prop.step()
-        running.append(loss_p.item())
-        if writer and (batch_idx + ep*len(dataloader)) % 5 == 0:
-          writer.add_scalar("Prop/loss", loss_p.item(), ep*len(dataloader)+batch_idx)
-
-        scheduler_prop.step(np.mean(running))
-        return np.mean(running)
- 
-    recon_loss_fn = loss() if loss is not None else nn.MSELoss()
-    prop_loss_fn  = nn.MSELoss()
-    encoding_param = determine_param(self.dataset, encoding_param)
-    all_losses   = {'ae': [], 'prop': []}
-    all_testerrs = []
-
-    for w in range(self.W):
-      if len(self.aes) <= w:
-        self.aes.append(self.aeclass(**self.aeparams))
-      if len(self.props) <= w:
-        self.props.append(self.propclass(**self.propparams))
-
-      ae   = self.aes[w].to(self.device)
-      prop = self.props[w].to(self.device)
-      train = torch.tensor(self.alltrain[:, self.windowvals[w], :], dtype=torch.float32, device=self.device)
-      test  = self.alltest[:, self.windowvals[w], :]
-
-      if isinstance(ae, PCAAutoencoder):
-        ae.train_pca(train.cpu().numpy())
-        e1,e2,ei = get_proj_errors(ae, test, ords=(1,2,np.inf))
-
-        print("Trained PCA for window ", w+1)
-        print(f"Relative AE Error (1, 2, inf): {e1:.3f}, {e2:.3f}, {ei:.3f}")
-        continue
-
-      opt_ae  = optim(ae.parameters(), lr=lr, weight_decay=ridge)
-      opt_prop = optim(prop.parameters(), lr=lr / 5, weight_decay=ridge)
-      scheduler_ae = lr_scheduler.ReduceLROnPlateau(opt_ae, patience=20)
-      scheduler_prop = lr_scheduler.ReduceLROnPlateau(opt_prop, patience=20)
-      dataloader = DataLoader(train, batch_size=batch)
-
-      writer = None
-      if self.td:
-        tb_dir = f"./tensorboard/{datetime.datetime.now():%Y%m%d}/{self.td}-w{w}"
-        writer = SummaryWriter(tb_dir)
-
-      best = {'loss': float('inf'), 'state': None}
-      ae_losses, prop_losses = [], []
-
-      for ep in range(epochs):
-        la = train_epoch_ae(ep)
-        lp = train_epoch_prop(ep)
-
-        losses_w.append(la)
-        props_w.append(lp)
-      
-        if ep % printinterval == 0:
-          t1,t2,ti = get_proj_errors(ae, test, ords=(1,2,np.inf))
-          if scheduler:
-            print(f"{ep+1}: Train Loss {la:.3e} + {lp:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative AE Error (1, 2, inf): {t1:.3f}, {t2:.3f}, {ti:.3f}")
-          else:
-            print(f"{ep+1}: Train Loss {la:.3e} + {lp:.3e},, Relative AE Error (1, 2, inf): {t1:.3f}, {t2:.3f}, {ti:.3f}")
-
-        if best and ep>epochs//2:
-          if np.mean([la,lp]) < best['loss']:
-            best.update({'loss': np.mean([la,lp]), 'model': ae.state_dict(), 'opt': opt_ae.state_dict(), 'ep': ep})
-          elif verbose:
-            print(f"Loss not improved at epoch {ep} (Ratio: {np.mean([la,lp])/best['loss']:.2f}) from {best['ep']} (Loss: {best['loss']:.2e})")
-        
-        print(f"Finish training AE and Prop {w} at {time.asctime()}.")
-
-        if best: 
-          ae.load_state_dict(best['model'])
-          opt_ae.load_state_dict(best['opt'])
-
-        all_losses['ae'].append(ae_losses)
-        all_losses['prop'].append(prop_losses)
-        all_testerrs.append(testerrs)
-
-    if save:
-      torch.save({'aes': [ae.state_dict() for ae in self.aes], 'props': [p.state_dict() for p in self.props]}, f"{self.prefix}_alttrain.pth")
-
-    return all_losses, all_testerrs
-
-  def train_transcoders(self, epochs, save=True, optim=torch.optim.AdamW, lr=1e-4, verbose=False, propagated_trans=False, printinterval=10, batch=32, ridge=0, loss=None, encoding_param=-1, best=True):
+  def train_transcoders(self, epochs, save=True, optim=torch.optim.AdamW, lr=1e-4, verbose=False, propagated_trans=True, printinterval=10, batch=32, ridge=0, loss=None, encoding_param=-1, best=True):
     def transcoder_epoch(model, dataloader, writer=None, scheduler=None, optimizer=None, ep=0, printinterval=10, loss=None, testarr=None):
       losses = []
       testerrors1 = []
@@ -1631,7 +1585,7 @@ class WeldNet(WindowTrajectory):
         x = batch[:, :, 0]
         y = batch[:, :, 1]
 
-        predict = model.forward(x)
+        predict = self.trans_forward(model, x)
 
         if self.residualprop:
           predict = x + predict
@@ -1784,7 +1738,7 @@ class WeldNet(WindowTrajectory):
         pickle.dump({"trans": self.transcoders, "transdata": self.transcoderdata, "datadata": self.datadata}, handle, protocol=pickle.HIGHEST_PROTOCOL)
         print("Transcoders saved at", addr)
 
-    self.transepoch.append(epochs)
+    self.transepochs.append(epochs)
     print("Finished training all timewindow transcoders")
     return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf }
 
@@ -1893,24 +1847,37 @@ class WeldNet(WindowTrajectory):
           xt = x
 
         if self.accumulateprop:
-          x0 = x[:, :1]
+          # x0 = x[:, :1]
 
-          xlist = []
-          for i in range(x.shape[1]):
-            if self.residualprop:
-              x0 = x0 + model(x0)
-            else:
-              x0 = model(x0)
+          # xlist = []
+          # for i in range(x.shape[1]):
+          #   if self.residualprop:
+          #     x0 = x0 + model(x0)
+          #   else:
+          #     x0 = model(x0)
 
-            xlist.append(x0)
+          #   xlist.appendtransepoch(x0)
 
-          predict = torch.cat(xlist, dim=1)
+          # predict = torch.cat(xlist, dim=1)
 
-        else:
+          xt = xt[:, :-1]
+          x = x[:, :-1]
           predict = model(xt)
-
           if self.residualprop:
             predict = x + predict
+
+          predict2 = model(predict)
+          if self.residualprop:
+            predict2 = predict + predict2
+
+          predict = predict2
+          y = y[:, 1:]
+
+        else:
+          predict = self.prop_forward(model, x)
+          
+          # if self.passparams:
+          #   y = y[..., :-self.dataset.params.shape[1]]
 
         if self.decodedprop:
           decoder = self.aes[w]
@@ -2040,8 +2007,9 @@ class WeldNet(WindowTrajectory):
 
     return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf}
 
-  def load_models(self, filename_prefix, verbose=False, min_epochs=0):
-    search_path = f"savedmodels/weld/{filename_prefix}*.pickle"
+  def load_models(self, filename_prefix, directory="weld", verbose=False, min_epochs=0, together=False):
+    search_path = f"savedmodels/{'weldtogether' if together else 'weld'}/{filename_prefix}*.pickle"
+
     matching_files = glob.glob(search_path)
 
     print("Searching for model files matching prefix:", filename_prefix)
@@ -2128,7 +2096,11 @@ class WeldNet(WindowTrajectory):
         f"{now}.pickle"
     )
 
-    dire = "savedmodels/weld"
+    if self.metadata.get("trainedtogether", False):
+      dire = "savedmodels/weldtogether"
+    else:
+      dire = "savedmodels/weld"
+
     addr = os.path.join(dire, filename)
 
     if not os.path.exists(dire):
@@ -2386,8 +2358,8 @@ class WeldHelper():
       aeparams.sample.spatial_resolution = din
       if "k" in args:
         aeparams.sample.latents_dims = args["k"]
-        seqclass["seq"][0] = args["k"]
-        seqclass["seq"][-1] = args["k"]
+        seqparams["seq"][0] = args["k"]
+        seqparams["seq"][-1] = args["k"]
       seqparams["activation"] = get_activation(seqparams["activation"])
     else:
       if aeclass == PCAAutoencoder:
@@ -2421,6 +2393,7 @@ class WeldHelper():
     autonomous = args.get("autonomous", True)
     accumulateprop = args.get("accumulateprop", False)
     decodedprop = args.get("decodedprop", False)
+    passparams = args.get("passparams", False)
 
     if aeclass == GIAutoencoder or aeclass == TCAutoencoder:
       # assume it is an integer, equally spaced grid on [0, 1]
@@ -2434,7 +2407,7 @@ class WeldHelper():
       propparams["seq"][0] = propparams["seq"][-1] + 1
 
 
-    return WeldNet(dataset, windows, aeclass, aeparams.copy(), seqclass, propparams, seqclass, copy.deepcopy(seqparams), straightness=straightness,accumulateprop=accumulateprop, decodedprop=decodedprop, kinetic=kinetic, td=td, seed=seed, device=device, autonomous=autonomous)
+    return WeldNet(dataset, windows, aeclass, aeparams.copy(), seqclass, propparams, seqclass, copy.deepcopy(seqparams), passparams=passparams, straightness=straightness,accumulateprop=accumulateprop, decodedprop=decodedprop, kinetic=kinetic, td=td, seed=seed, device=device, autonomous=autonomous)
     #return WeldNet(dataset, windows, aeclass, aeparams, seqclass, seqparams, seqclass, seqparams, straightness=straightness, accumulateprop=accumulateprop, decodedprop=decodedprop, kinetic=kinetic, td=td, seed=seed, device=device, autonomous=autonomous)
   
   @staticmethod
@@ -2454,7 +2427,7 @@ class WeldHelper():
     for w in ws:
       dim = weld.aes[w].reduced
 
-      arr = weld.tests[w] if testonly else weld.dataset.data[:, weld.windowvals[w], :]
+      arr = weld.tests[w] if testonly else np.concat([weld.tests[w], weld.trains[w].cpu().numpy()]) 
       arr, params = utils.collect_times_dataparams(arr, weld.dataset.params)
       arr = torch.tensor(arr).to(weld.device, dtype=torch.float32)
       enc = weld.encode_window(w, arr)
@@ -2526,11 +2499,17 @@ class WeldHelper():
 
     allpoints = []
     allparams = []
+
+    if testonly:
+      dataset = weld.alltest
+    else:
+      dataset = np.concat([weld.tests[w], weld.trains[w].cpu().numpy()]) 
+
     for t in ts:
       w = weld.find_window(t)
       dim = weld.aes[w].reduced
 
-      arr = weld.alltest[:, t:t+1, :] if testonly else weld.dataset.data[:, t:t+1, :]
+      arr = dataset[:, t:t+1, :]
       arr, params = utils.collect_times_dataparams(arr, weld.dataset.params)
       arr = torch.tensor(arr).to(weld.device, dtype=torch.float32)
       enc = weld.encode_window(w, arr)
@@ -2636,13 +2615,16 @@ class WeldHelper():
 
     errors = []
     for t in times:
-      data = weld.dataset.data[weld.numtrain:, t:t+1, :] if testonly else weld.dataset.data[:, t:t+1, :]
+      data = weld.alltest[:, t:t+1, :] if testonly else np.concat([weld.alltest, weld.alltrain])[:, t:t+1, :]
       data = utils.collect_times_dataparams(data)
       data = torch.tensor(data).to(weld.device, dtype=torch.float32)
 
       w = weld.find_window(t)
       proj = weld.project_window(w, data).cpu().detach().numpy()
       data = data.cpu().detach().numpy()
+
+      if weld.passparams:
+        data = data[..., :-weld.dataset.params.shape[1]]
 
       if relative:
         errors.append(np.mean(np.linalg.norm(proj - data) / np.linalg.norm(data)))
@@ -2676,12 +2658,16 @@ class WeldHelper():
     assert(t + steps < weld.T)
 
     if testonly:
-      data = weld.dataset.data[weld.numtrain:, :, :]
+      data = weld.alltest
     else:
-      data = weld.dataset.data
+      data = np.concat([weld.alltest, weld.alltrain])
 
     inputt = torch.tensor(data[:, t, :]).to(weld.device, dtype=torch.float32)
-    references = [data[:, t+s, :] for s in range(1, steps+1)]
+
+    if weld.passparams:
+      references = [data[:, t+s, :-weld.dataset.params.shape[1]] for s in range(1, steps+1)]
+    else:
+      references = [data[:, t+s, :] for s in range(1, steps+1)]
 
     predicteds = weld.propagate(inputt, t, steps)
     predictedvals = [weld.decode_window(weld.find_window(t+i+1), x).cpu().detach().numpy() for i, x in enumerate(predicteds)]
@@ -3350,7 +3336,7 @@ class EncoderNet(nn.Module):
 
 #       # print test
 #       if printinterval > 0 and (ep % printinterval == 0):
-#         testerr1, testerr2, testerrinf = get_proj_errors(model, testarr, ords=(1, 2, np.inf))
+#         testerr1, testerr2, testerrinf = self.get_proj_errors(model, testarr, ords=(1, 2, np.inf))
 #         if scheduler is not None:
 #           print(f"{ep+1}: Train Loss {error:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
 #         else:

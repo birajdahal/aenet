@@ -10,16 +10,15 @@ aeparams:
     spatial_resolution: 512
     latents_dims: 4
   downblocks:
-    channels: [8, 16, 32, 32, 32]
-    kernel_stride_paddings: 
-    - [8, 2, 1]
-    - [8, 2, 1]
-    - [8, 2, 1]
-    - [4, 2, 1]
-    - [4, 2, 1]
-    actvn: relu
-    padding: circular # for burgers' data
-
+      channels: [16, 16, 16, 16]
+      kernel_stride_paddings: 
+      - [32, 2, 1]
+      - [32, 2, 1]
+      - [32, 2, 1]
+      - [32, 2, 1]
+      actvn: relu
+      padding: circular # for burgers' data
+    
 seqclass: FFNet
 seqparams:
   seq: [4, 200, 200, 200, 4]

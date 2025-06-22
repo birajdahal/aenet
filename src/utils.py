@@ -13,6 +13,9 @@ from matplotlib.colors import hsv_to_rgb
 from sklearn.decomposition import PCA
 from omegaconf import DictConfig
 
+import torch
+import torch.nn as nn
+
 def get_pca_error(data, k, ord=2):
   pca = PCA(n_components=k)
 
@@ -115,6 +118,16 @@ def duplicate_rows(arr, T):
 
     return result_array
 
+def reduce_params(params, tol=1e-4):
+  arr = np.asarray(params)
+  if arr.ndim != 2:
+      raise ValueError("params must be 2-D (N × p)")
+
+  # np.ptp gives max–min along each column
+  varying = np.ptp(arr, axis=0) > tol
+  out = arr[:, varying]
+  return out
+
 # NEED TO IMPLEMENT SHIFTING FOR THE SCALE
 class DynamicData(torch.utils.data.Dataset):
   def __init__(self, inconfig, seed=0, spacedim=1):
@@ -171,9 +184,14 @@ class DynamicData(torch.utils.data.Dataset):
 
     self.data = np.float32(self.data)
     self.params = np.float32(self.params)
+
+    if self.params is not None:
+      self.params = reduce_params(self.params)
     
     np.random.seed(seed)
     self.shuffle_inplace()
+
+    del self.origdata
     
   def __len__(self):
     return len(self.data)
