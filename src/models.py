@@ -57,6 +57,10 @@ class FFNet(nn.Module):
     super().__init__()
 
     self.layers = nn.ModuleList([nn.Linear(seq[i], seq[i+1]) for i in range(len(seq) - 1)])
+    
+    if type(activation) == type(""):
+      activation = get_activation(activation)
+      
     self.s = activation
 
   def forward(self, x):
@@ -521,7 +525,7 @@ class TimeInputModel():
       testarr = torch.tensor(testarr, dtype=torch.float32)
 
     if times is None:
-      times = range(1, self.T)
+      times = torch.linspace(0, 1, self.T)[1:]
   
     out = self.forward(testarr[:, 0], times)
     
@@ -559,24 +563,33 @@ class TimeInputModel():
     if isinstance(self.model, FFNet):
       origshape = list(x.shape[-self.datadim:])
       x = x.reshape(list(x.shape[:-self.datadim]) + [-1])
-      
-      xts = [torch.cat((x, t * torch.ones((x.shape[0], 1))), dim=1) for t in ts]
-      xt = torch.stack(xts, dim=1)
-      out = self.model(xt)
 
+      T = ts.shape[0]
+      x_exp = x.unsqueeze(-2)
+      t_exp = ts.reshape(*([1] * (x.dim() - 1)), -1, 1)
+
+      x_brd = x_exp.expand(*x.shape[:-1], T, x.shape[-1])
+      t_brd = t_exp.expand(*x.shape[:-1], T, 1)
+
+      xts = torch.cat((x_brd, t_brd), dim=-1)         
+  
+      out = self.model(xts)
       return out.reshape(list(out.shape)[:-1] + origshape)
         
     elif isinstance(self.model, DeepONet):
-      spaces = torch.linspace(0, 1, x.shape[1]).reshape([-1, 1])
+      B, S = x.shape
+      device = x.device
 
-      inputlist = [torch.cat((spaces, t * torch.ones((spaces.shape[0], 1))), dim=1) for t in ts]
-      inputs = torch.stack(inputlist, dim=1)
+      ts_tensor = torch.as_tensor(ts, device=device)
+      spaces = torch.linspace(0, 1, S, device=device)
+
+      s_grid, t_grid = torch.meshgrid(spaces, ts_tensor, indexing='ij')
+
+      inputs = torch.stack((s_grid, t_grid), dim=-1)
+      
       out = self.model(x, inputs)
       return out
-
-    elif isinstance(self.model, FNO1d):
-      return self.model(x, ts)
-  
+    
     else:
       assert(False)
 
@@ -646,12 +659,12 @@ class TimeInputModel():
       def closure(batch):
         optimizer.zero_grad()
         
-        out = self.forward(batch[:, 0], range(1, self.T))
+        out = self.forward(batch[:, 0], torch.linspace(0, 1, self.T)[1:])
 
         res = loss(batch[:, 1:] - out, torch.zeros_like(out))
         res.backward()
         
-        if writer is not None and self.trainstep % 5:
+        if writer is not None and self.trainstep % 5 == 0:
           writer.add_scalar("main/loss", res, global_step=self.trainstep)
 
         return res
@@ -2427,7 +2440,7 @@ class WeldHelper():
     for w in ws:
       dim = weld.aes[w].reduced
 
-      arr = weld.tests[w] if testonly else np.concat([weld.tests[w], weld.trains[w].cpu().numpy()]) 
+      arr = weld.tests[w] if testonly else np.concatenate([weld.tests[w], weld.trains[w].cpu().numpy()]) 
       arr, params = utils.collect_times_dataparams(arr, weld.dataset.params)
       arr = torch.tensor(arr).to(weld.device, dtype=torch.float32)
       enc = weld.encode_window(w, arr)
@@ -2503,7 +2516,7 @@ class WeldHelper():
     if testonly:
       dataset = weld.alltest
     else:
-      dataset = np.concat([weld.tests[w], weld.trains[w].cpu().numpy()]) 
+      dataset = np.concatenate([weld.tests[w], weld.trains[w].cpu().numpy()]) 
 
     for t in ts:
       w = weld.find_window(t)
@@ -2615,7 +2628,7 @@ class WeldHelper():
 
     errors = []
     for t in times:
-      data = weld.alltest[:, t:t+1, :] if testonly else np.concat([weld.alltest, weld.alltrain])[:, t:t+1, :]
+      data = weld.alltest[:, t:t+1, :] if testonly else np.concatenate([weld.alltest, weld.alltrain])[:, t:t+1, :]
       data = utils.collect_times_dataparams(data)
       data = torch.tensor(data).to(weld.device, dtype=torch.float32)
 
@@ -2660,7 +2673,7 @@ class WeldHelper():
     if testonly:
       data = weld.alltest
     else:
-      data = np.concat([weld.alltest, weld.alltrain])
+      data = np.concatenate([weld.alltest, weld.alltrain])
 
     inputt = torch.tensor(data[:, t, :]).to(weld.device, dtype=torch.float32)
 

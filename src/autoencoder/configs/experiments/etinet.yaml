@@ -1,0 +1,15 @@
+__object__:
+  path: models
+  name: ETINetHelper
+  args: as_config
+
+recclass: FFNet
+recparams:
+  seq: [4, 600, 600, 600, 1]
+  activation: relu
+
+aeclass: FFAutoencoder
+aeparams:
+  encodeSeq: [4, 600, 600, 600, 1]
+  decodeSeq: [4, 600, 600, 600, 1]
+  activation: relu

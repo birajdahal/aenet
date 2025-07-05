@@ -14,5 +14,5 @@ aeparams:
 
 seqclass: FFNet
 seqparams:
-  seq: [4, 250, 250, 250, 4]
+  seq: [4, 300, 300, 300, 4]
   activation: relu
