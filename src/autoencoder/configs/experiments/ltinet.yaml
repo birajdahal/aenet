@@ -3,7 +3,7 @@ __object__:
   name: LTINetHelper
   args: as_config
 
-decclass: FFNet
-decparams:
+recclass: FFNet
+recparams:
   seq: [4, 800, 800, 800, 1]
   activation: relu

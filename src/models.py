@@ -2,6 +2,7 @@
 
 import time
 import glob
+import itertools
 import datetime
 import copy
 import os
@@ -473,10 +474,11 @@ class WindowTrajectory():
     return self.encode_model(self.aes[w], tensor)
 
 class TimeInputModel():
-  def __init__(self, dataset, ticlass, tiinfo, activation, td, seed, device):
+  def __init__(self, dataset, ticlass, tiinfo, activation, useparams=False, td=None, seed=0, device=0):
     self.dataset = dataset
     self.device = device
     self.td = td
+    self.useparams = useparams
   
     if self.td is None:
       self.prefix = f"{self.dataset.name}{str(ticlass.__name__)}"
@@ -486,6 +488,7 @@ class TimeInputModel():
     torch.manual_seed(seed)
     np.random.seed(seed)
     self.seed = seed
+    self.timetaken = 0
 
     datacopy = self.dataset.data.copy()
     self.numtrain = int(datacopy.shape[0] * 0.8)
@@ -493,13 +496,27 @@ class TimeInputModel():
     self.T = self.dataset.data.shape[1]
     self.trainarr = datacopy[:self.numtrain]
     self.testarr = datacopy[self.numtrain:]
+
+    if self.useparams:
+      T = self.trainarr.shape[1] 
+      
+      paramtrain = np.repeat(self.dataset.params[:self.numtrain, None, :], T, axis=1)
+      paramtest  = np.repeat(self.dataset.params[self.numtrain:, None, :], T, axis=1) 
+
+      self.trainarr = np.concatenate([self.trainarr, paramtrain], axis=-1)
+      self.testarr = np.concatenate([self.testarr, paramtest], axis=-1)
+
     self.ticlass = ticlass
     self.optparams = None
 
     self.datadim = len(self.dataset.data.shape) - 2
     if len(tiinfo) == 1:
+      if self.useparams:
+        tiinfo[0][0] += dataset.params.shape[1]
+
       self.model = self.ticlass(tiinfo[0], activation).to(self.device)
     elif len(tiinfo) == 2:
+      assert(not self.useparams) # not yet implemented
       self.model = self.ticlass(tiinfo[0], tiinfo[1], activation).to(self.device)
     else:
       assert(False)
@@ -515,8 +532,10 @@ class TimeInputModel():
       "data_shape": list(dataset.data.shape),
       "data_checksum": float(np.sum(dataset.data)),
       "seed": seed,
-      "epochs": []
+      "useparams": self.useparams
     }
+
+    self.epochs = []
 
   def get_ti_errors(self, testarr, ords=(2,), times=None, aggregate=True):
     assert(aggregate or len(ords) == 1)
@@ -532,6 +551,9 @@ class TimeInputModel():
     n = testarr.shape[0]
     orig = testarr[:, 1:].cpu().detach().numpy()
     out = out.cpu().detach().numpy()
+
+    if self.useparams:
+      orig = orig[..., :-self.dataset.params.shape[1]]
 
     if aggregate:
       orig = orig.reshape([n, -1])
@@ -562,6 +584,7 @@ class TimeInputModel():
   def forward(self, x, ts):
     if isinstance(self.model, FFNet):
       origshape = list(x.shape[-self.datadim:])
+
       x = x.reshape(list(x.shape[:-self.datadim]) + [-1])
 
       T = ts.shape[0]
@@ -574,6 +597,10 @@ class TimeInputModel():
       xts = torch.cat((x_brd, t_brd), dim=-1)         
   
       out = self.model(xts)
+
+      if self.useparams:
+        origshape[-1] -= self.dataset.params.shape[1]
+
       return out.reshape(list(out.shape)[:-1] + origshape)
         
     elif isinstance(self.model, DeepONet):
@@ -613,11 +640,11 @@ class TimeInputModel():
       meta = dic.get("metadata", {})
       is_match = all(
           meta.get(k) == self.metadata.get(k)
-          for k in ["model_class", "tiinfo", "activation", "dataset_name", "data_shape", "seed"]
+          for k in meta.keys()
       )
 
       # Check if model meets the minimum epoch requirement
-      model_epochs = meta.get("epochs")
+      model_epochs = dic["epochs"]
       if model_epochs is None:
           if verbose:
               print(f"Skipping {addr} due to missing epoch metadata.")
@@ -635,7 +662,8 @@ class TimeInputModel():
       if is_match:
           print("Model match found. Loading from:", addr)
           self.model.load_state_dict(dic["model"])
-          self.metadata["epochs"] = meta.get("epochs")
+          self.epochs = model_epochs
+          self.timetaken = dic["timetaken"]
           if "opt" in dic:     
             self.optparams = dic["opt"]
 
@@ -660,6 +688,9 @@ class TimeInputModel():
         optimizer.zero_grad()
         
         out = self.forward(batch[:, 0], torch.linspace(0, 1, self.T)[1:])
+
+        if self.useparams:
+          batch = batch[..., :-self.dataset.params.shape[1]]
 
         res = loss(batch[:, 1:] - out, torch.zeros_like(out))
         res.backward()
@@ -701,7 +732,7 @@ class TimeInputModel():
     test = self.testarr  
 
     opt = optim(self.model.parameters(), lr=lr, weight_decay=ridge)
-    scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30)
+    scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
     dataloader = DataLoader(train, shuffle=False, batch_size=batch)
 
     if self.optparams is not None:
@@ -717,6 +748,7 @@ class TimeInputModel():
     print(f"Starting training TI model {self.metadata['model_class']} at {time.asctime()}...")
     print("train", train.shape, "test", test.shape)
       
+    start = time.time()
     bestdict = { "loss": float(np.inf), "ep": 0 }
     for ep in range(epochs):
       lossesN, testerrors1N, testerrors2N, testerrorsinfN = train_epoch(dataloader, optimizer=opt, scheduler=scheduler, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test)
@@ -732,6 +764,8 @@ class TimeInputModel():
         elif verbose:
           print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
       
+    end = time.time()
+    self.timetaken += end - start
     print(f"Finished training TI model {self.metadata['model_class']} at {time.asctime()}...")
 
     if best:
@@ -739,14 +773,14 @@ class TimeInputModel():
       opt.load_state_dict(bestdict["opt"])
 
     self.optparams = opt.state_dict()
-    self.metadata["epochs"].append(epochs)
+    self.epochs.append(epochs)
 
     if save:
       now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
       readable_shape = "x".join(map(str, self.metadata["tiinfo"]))
 
       # Compute total training epochs
-      total_epochs = sum(self.metadata["epochs"]) if isinstance(self.metadata["epochs"], list) else self.metadata["epochs"]
+      total_epochs = sum(self.epochs) if isinstance(self.epochs, list) else self.epochs
 
       filename = (
           f"{self.dataset.name}_"
@@ -768,7 +802,9 @@ class TimeInputModel():
           pickle.dump({
               "model": self.model.state_dict(),
               "metadata": self.metadata,
-              "opt": self.optparams
+              "opt": self.optparams,
+              "epochs": self.epochs,
+              "timetaken": self.timetaken
           }, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
       print("Model saved at", addr)
@@ -792,7 +828,6 @@ class WeldNet(WindowTrajectory):
     self.residualprop = True
 
     self.accumulateprop = accumulateprop
-    assert(not accumulateprop)
     assert(autonomous)
 
     self.decodedprop = decodedprop
@@ -804,14 +839,15 @@ class WeldNet(WindowTrajectory):
       propparams["seq"][0] = propparams["seq"][-1] + 1
 
     if self.passparams:
+      f = self.dataset.params.shape[1]
       propparams["seq"] = list(propparams["seq"])
-      propparams["seq"][0] = propparams["seq"][0] + 1
+      propparams["seq"][0] = propparams["seq"][0] + f
 
       transparams["seq"] = list(transparams["seq"])
-      transparams["seq"][0] = transparams["seq"][0] + 1
+      transparams["seq"][0] = transparams["seq"][0] + f
 
       aeparams["decodeSeq"] = list(aeparams["decodeSeq"])
-      aeparams["decodeSeq"][0] = aeparams["decodeSeq"][0] + 1
+      aeparams["decodeSeq"][0] = aeparams["decodeSeq"][0] + f
 
     assert(self.straightness == 0 or self.kinetic == 0)
 
@@ -830,6 +866,8 @@ class WeldNet(WindowTrajectory):
     self.props = []
     self.trains = []
     self.tests = []
+
+    self.timetaken = 0
 
     self.alltrain = datacopy[:self.numtrain]
     self.alltest = datacopy[self.numtrain:]
@@ -886,8 +924,10 @@ class WeldNet(WindowTrajectory):
       "data_shape": list(dataset.data.shape),
       "data_checksum": float(np.sum(dataset.data)),
       "seed": seed,
-      "epochs": [],
+      "passparams": False
     }
+
+    self.epochs = []
 
     if self.passparams:
       self.metadata["passparams"] = True
@@ -963,149 +1003,149 @@ class WeldNet(WindowTrajectory):
 
     return codeslist
 
-  def load_all(self, filename, verbose=False):
-    assert(False)
-    matching_files = glob.glob(f"savedmodels/weld/props/{filename}*{self.W}w-props-*")
+  # def load_all(self, filename, verbose=False):
+  #   assert(False)
+  #   matching_files = glob.glob(f"savedmodels/weld/props/{filename}*{self.W}w-props-*")
 
-    matchedfile = False
-    for addr in matching_files:
-        with open(addr, "rb") as handle:
-            dic = pickle.load(handle)
-            matchedfile = True
+  #   matchedfile = False
+  #   for addr in matching_files:
+  #       with open(addr, "rb") as handle:
+  #           dic = pickle.load(handle)
+  #           matchedfile = True
 
-            for i in range(len(self.propdata)):
-              if type(self.propdata[i]) == type({}):
-                if str(self.propdata[i].values()) != str(dic["propdata"][i].values()):
-                  matchedfile = False
-                  if verbose:
-                    print("NO MATCH", self.propdata[i].values(), dic["propdata"][i].values())
+  #           for i in range(len(self.propdata)):
+  #             if type(self.propdata[i]) == type({}):
+  #               if str(self.propdata[i].values()) != str(dic["propdata"][i].values()):
+  #                 matchedfile = False
+  #                 if verbose:
+  #                   print("NO MATCH", self.propdata[i].values(), dic["propdata"][i].values())
 
-              elif str(self.propdata[i]) != str(dic["propdata"][i]):
-                matchedfile = False
-                if verbose:
-                  print("NO MATCH", self.propdata[i], dic["propdata"][i])
+  #             elif str(self.propdata[i]) != str(dic["propdata"][i]):
+  #               matchedfile = False
+  #               if verbose:
+  #                 print("NO MATCH", self.propdata[i], dic["propdata"][i])
 
-            for i in range(len(self.aedata)):
-              if type(self.aedata[i]) == type({}):
-                if str(self.aedata[i].values()) != str(dic["aedata"][i].values()):
-                  matchedfile = False
-                  if verbose:
-                    print("NO MATCH", self.aedata[i].values(), dic["aedata"][i].values())
+  #           for i in range(len(self.aedata)):
+  #             if type(self.aedata[i]) == type({}):
+  #               if str(self.aedata[i].values()) != str(dic["aedata"][i].values()):
+  #                 matchedfile = False
+  #                 if verbose:
+  #                   print("NO MATCH", self.aedata[i].values(), dic["aedata"][i].values())
 
-              elif str(self.aedata[i]) != str(dic["aedata"][i]):
-                matchedfile = False
-                if verbose:
-                  print("NO MATCH", self.aedata[i], dic["aedata"][i])
+  #             elif str(self.aedata[i]) != str(dic["aedata"][i]):
+  #               matchedfile = False
+  #               if verbose:
+  #                 print("NO MATCH", self.aedata[i], dic["aedata"][i])
 
-            if matchedfile:   
-              print("Loading aes and props from", addr)
-              self.props = dic["props"]
-              self.aes = dic["aes"]
-              break
-            elif verbose:
-              print("---")
+  #           if matchedfile:   
+  #             print("Loading aes and props from", addr)
+  #             self.props = dic["props"]
+  #             self.aes = dic["aes"]
+  #             break
+  #           elif verbose:
+  #             print("---")
 
-    if matchedfile:
-      if self.transcoderdata:
-        return self.load_transcoders(filename, verbose=verbose)
-      else:
-        return True
+  #   if matchedfile:
+  #     if self.transcoderdata:
+  #       return self.load_transcoders(filename, verbose=verbose)
+  #     else:
+  #       return True
     
-    else:   
-      print(f"Propagator failed. Could not match with any files")
-      print(matching_files)
-      return False
+  #   else:   
+  #     print(f"Propagator failed. Could not match with any files")
+  #     print(matching_files)
+  #     return False
 
-  def load_aes(self, filename, verbose=False):
-    assert(False)
-    matching_files = glob.glob(f"savedmodels/weld/{filename}*{self.W}w-*")
-    print("Searching for", str(self.aedata), str(self.datadata))
+  # def load_aes(self, filename, verbose=False):
+  #   assert(False)
+  #   matching_files = glob.glob(f"savedmodels/weld/{filename}*{self.W}w-*")
+  #   print("Searching for", str(self.aedata), str(self.datadata))
 
-    for addr in matching_files:
-      with open(addr, "rb") as handle:
-        dic = pickle.load(handle)
+  #   for addr in matching_files:
+  #     with open(addr, "rb") as handle:
+  #       dic = pickle.load(handle)
 
-        if str(self.aedata) == str(dic["aedata"]) and str(self.datadata) == str(dic["datadata"]):
-          print("Loading AEs from", addr)
-          self.aes = dic["aes"]
-          return True
-        elif verbose:
-          print("NO MATCH", str(dic["aedata"]), str(dic["datadata"]))
+  #       if str(self.aedata) == str(dic["aedata"]) and str(self.datadata) == str(dic["datadata"]):
+  #         print("Loading AEs from", addr)
+  #         self.aes = dic["aes"]
+  #         return True
+  #       elif verbose:
+  #         print("NO MATCH", str(dic["aedata"]), str(dic["datadata"]))
             
-    print(f"Load failed. Could not match with any files")
-    print(matching_files)
-    return False
+  #   print(f"Load failed. Could not match with any files")
+  #   print(matching_files)
+  #   return False
   
-  def load_aes_and_props(self, filename, verbose=False):
-    assert(False)
-    matching_files = glob.glob(f"savedmodels/weld/props/{filename}*{self.W}w-props-*")
+  # def load_aes_and_props(self, filename, verbose=False):
+  #   assert(False)
+  #   matching_files = glob.glob(f"savedmodels/weld/props/{filename}*{self.W}w-props-*")
 
-    matchedfile = False
-    for addr in matching_files:
-        with open(addr, "rb") as handle:
-            dic = pickle.load(handle)
-            matchedfile = True
+  #   matchedfile = False
+  #   for addr in matching_files:
+  #       with open(addr, "rb") as handle:
+  #           dic = pickle.load(handle)
+  #           matchedfile = True
 
-            for i in range(len(self.propdata)):
-              if type(self.propdata[i]) == type({}):
-                if str(self.propdata[i].values()) != str(dic["propdata"][i].values()):
-                  matchedfile = False
-                  if verbose:
-                    print("NO MATCH", self.propdata[i].values(), dic["propdata"][i].values())
+  #           for i in range(len(self.propdata)):
+  #             if type(self.propdata[i]) == type({}):
+  #               if str(self.propdata[i].values()) != str(dic["propdata"][i].values()):
+  #                 matchedfile = False
+  #                 if verbose:
+  #                   print("NO MATCH", self.propdata[i].values(), dic["propdata"][i].values())
 
-              elif str(self.propdata[i]) != str(dic["propdata"][i]):
-                matchedfile = False
-                if verbose:
-                  print("NO MATCH", self.propdata[i], dic["propdata"][i])
+  #             elif str(self.propdata[i]) != str(dic["propdata"][i]):
+  #               matchedfile = False
+  #               if verbose:
+  #                 print("NO MATCH", self.propdata[i], dic["propdata"][i])
 
-            for i in range(len(self.aedata)):
-              if type(self.aedata[i]) == type({}):
-                if str(self.aedata[i].values()) != str(dic["aedata"][i].values()):
-                  matchedfile = False
-                  if verbose:
-                    print("NO MATCH", self.aedata[i].values(), dic["aedata"][i].values())
+  #           for i in range(len(self.aedata)):
+  #             if type(self.aedata[i]) == type({}):
+  #               if str(self.aedata[i].values()) != str(dic["aedata"][i].values()):
+  #                 matchedfile = False
+  #                 if verbose:
+  #                   print("NO MATCH", self.aedata[i].values(), dic["aedata"][i].values())
 
-              elif str(self.aedata[i]) != str(dic["aedata"][i]):
-                matchedfile = False
-                if verbose:
-                  print("NO MATCH", self.aedata[i], dic["aedata"][i])
+  #             elif str(self.aedata[i]) != str(dic["aedata"][i]):
+  #               matchedfile = False
+  #               if verbose:
+  #                 print("NO MATCH", self.aedata[i], dic["aedata"][i])
 
-            if matchedfile:   
-              print("Loading aes and props from", addr)
-              self.props = dic["props"]
-              self.aes = dic["aes"]
-              break
-            elif verbose:
-              print("---")
+  #           if matchedfile:   
+  #             print("Loading aes and props from", addr)
+  #             self.props = dic["props"]
+  #             self.aes = dic["aes"]
+  #             break
+  #           elif verbose:
+  #             print("---")
 
-    if matchedfile:
-      return True
-    else:   
-      print(f"Propagator failed. Could not match with any files")
-      print(matching_files)
-      return False
+  #   if matchedfile:
+  #     return True
+  #   else:   
+  #     print(f"Propagator failed. Could not match with any files")
+  #     print(matching_files)
+  #     return False
     
-  def load_transcoders(self, filename, verbose=False):
-    assert(False)
-    assert self.transcoderdata is not None
+  # def load_transcoders(self, filename, verbose=False):
+  #   assert(False)
+  #   assert self.transcoderdata is not None
     
-    matching_files = glob.glob(f"savedmodels/weld/trans/{filename}*{self.W}w-*")
-    print("Searching for", str(self.transcoderdata), str(self.datadata))
+  #   matching_files = glob.glob(f"savedmodels/weld/trans/{filename}*{self.W}w-*")
+  #   print("Searching for", str(self.transcoderdata), str(self.datadata))
 
-    for addr in matching_files:
-      with open(addr, "rb") as handle:
-        dic = pickle.load(handle)
+  #   for addr in matching_files:
+  #     with open(addr, "rb") as handle:
+  #       dic = pickle.load(handle)
 
-        if str(self.transcoderdata) == str(dic["transdata"]) and str(self.datadata) == str(dic["datadata"]):
-          print("Loading transcoders from", addr)
-          self.transcoders = dic["trans"]
-          return True
-        elif verbose:
-          print("NO MATCH", str(dic["transdata"]), str(dic["datadata"]))
+  #       if str(self.transcoderdata) == str(dic["transdata"]) and str(self.datadata) == str(dic["datadata"]):
+  #         print("Loading transcoders from", addr)
+  #         self.transcoders = dic["trans"]
+  #         return True
+  #       elif verbose:
+  #         print("NO MATCH", str(dic["transdata"]), str(dic["datadata"]))
             
-    print(f"Load failed. Could not match with any files")
-    print(matching_files)
-    return False
+  #   print(f"Load failed. Could not match with any files")
+  #   print(matching_files)
+  #   return False
 
   def get_proj_errors(self, model, testarr, ords=(2,)):
     if isinstance(testarr, np.ndarray):
@@ -1172,9 +1212,9 @@ class WeldNet(WindowTrajectory):
     if self.passparams:
       out = torch.cat([out, params], dim=-1)
 
-    return prop(batch)
+    return out
 
-  def train_aes(self, epochs_first, warmstart_epochs=0, save=True, onlydecoder=False, optim=torch.optim.AdamW, lr=1e-4, plottb=False, gridbatch=None, printinterval=10, batch=32, ridge=0, loss=None, encoding_param=-1, best=True, verbose=False):    
+  def train_aes(self, epochs_first, warmstart_epochs=0, save=True, onlydecoder=False, roll=False, optim=torch.optim.AdamW, lr=1e-4, plottb=False, gridbatch=None, printinterval=10, batch=32, ridge=0, loss=None, encoding_param=-1, best=True, verbose=False):    
       def ae_epoch(model, dataloader, writer=None, optimizer=None, scheduler=None, ep=0, printinterval=10, loss=None, testarr=None):
         losses = []
         testerrors1 = []
@@ -1229,6 +1269,10 @@ class WeldNet(WindowTrajectory):
           #     penalties += self.kinetic * penalty
 
           #   total += res
+
+          if roll:
+            rot = np.random.randint(0, batch.shape[-1])
+            batch = torch.roll(batch, shifts=rot, dims=-1)
 
           if isinstance(model, FFVAE):
             recon, mu, logvar = model(batch, variance=True)
@@ -1304,6 +1348,7 @@ class WeldNet(WindowTrajectory):
 
       losses_all, testerrors1_all, testerrors2_all, testerrorsinf_all = [], [], [], []
 
+      start = time.time()
       print(f"Training {self.W} WeldNet AEs")
       self.trains = []
       self.tests = []
@@ -1402,22 +1447,26 @@ class WeldNet(WindowTrajectory):
           pickle.dump({"aes": self.aes, "aedata": self.aedata, "datadata": self.datadata}, handle, protocol=pickle.HIGHEST_PROTOCOL)
           print("AEs saved at", addr)
 
+      end = time.time()
+      self.timetaken += end - start
       print("Finished training all timewindows")
       return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf }
 
-  def train_aes_plus_props(self, epochs, lamb=0.1, save=True, optim=torch.optim.AdamW, lr=1e-4, plottb=False, gridbatch=None, printinterval=10, batch=32, ridge=0, loss=None, encoding_param=-1, best=True, verbose=False):    
+  def train_aes_plus_props(self, epochs, lamb=0.1, save=True, roll=False, optim=torch.optim.AdamW, lr=1e-4, plottb=False, gridbatch=None, printinterval=10, batch=32, ridge=0, loss=None, encoding_param=-1, best=True, verbose=False):    
     def both_epoch(model, modelprop, dataloader, writer=None, optimizer=None, scheduler=None, ep=0, printinterval=10, loss=None, testarr=None):
       losses = []
       testerrors1 = []
       testerrors2 = []
       testerrorsinf = []
 
-      device = self.device
-
       def closure(batch):
         optimizer.zero_grad()
 
         assert(self.straightness + self.kinetic == 0)
+
+        if roll:
+          rot = np.random.randint(0, batch.shape[-1])
+          batch = torch.roll(batch, shifts=rot, dims=-1)
 
         enc = self.encode_model(model, batch)
 
@@ -1446,9 +1495,27 @@ class WeldNet(WindowTrajectory):
         starts = enc[:, :-1]
         exacts = enc[:, 1:]
 
-        predicted = modelprop(starts) # to do
-        if self.residualprop:
-          predicted = starts + predicted
+        # predicted = modelprop(starts)
+
+        # if self.residualprop:
+        #   if self.passparams:
+        #     zeroarr = torch.zeros(list(predicted.shape[:-1]) + [self.dataset.params.shape[1]])
+        #     predicted = torch.concat([predicted, zeroarr], axis=-1)
+            
+        #   predicted = starts + predicted
+
+        if self.accumulateprop and False:
+          x0 = starts[:, :1]
+
+          xlist = []
+          for _ in range(starts.shape[1]):
+            x0 = self.prop_forward(modelprop, x0)
+            xlist.append(x0)
+
+          predicted = torch.cat(xlist, dim=1)
+
+        else:
+          predicted = self.prop_forward(modelprop, starts)
 
         self.error = loss(predicted, exacts)
 
@@ -1493,15 +1560,16 @@ class WeldNet(WindowTrajectory):
 
     losses_all, testerrors1_all, testerrors2_all, testerrorsinf_all = [], [], [], []
 
+    start = time.time()
     self.metadata["trainedtogether"] = True
     print(f"Training {self.W} WeldNet AEs and props together")
     self.trains = []
     self.tests = []
     for w in range(self.W):
       if len(self.aes) <= w:
-        self.aes.append(self.aeclass(**self.aeparams) if self.aeclass not in JC_MODULES else aeclass(aeparams.copy()))
+        self.aes.append(self.aeclass(**self.aeparams) if self.aeclass not in JC_MODULES else self.aeclass(self.aeparams.copy()))
       if len(self.props) <= w:
-        self.props.append(self.propclass(**self.propparams) if self.propclass not in JC_MODULES else propclass(propparams.copy()))
+        self.props.append(self.propclass(**self.propparams) if self.propclass not in JC_MODULES else propclass(propclass.copy()))
 
       ae = self.aes[w]
       prop = self.props[w]
@@ -1580,6 +1648,8 @@ class WeldNet(WindowTrajectory):
         pickle.dump({"aes": self.aes, "aedata": self.aedata, "datadata": self.datadata}, handle, protocol=pickle.HIGHEST_PROTOCOL)
         print("AEs saved at", addr)
 
+    end = time.time()
+    self.timetaken += end - start
     print("Finished training all timewindows")
     return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf } 
 
@@ -1660,7 +1730,8 @@ class WeldNet(WindowTrajectory):
     
     losses_all, testerrors1_all, testerrors2_all, testerrorsinf_all = [], [], [], []
 
-    print(f"Training {self.W} WeldNet Transcoders")
+    start = time.time()
+    print(f"Training {self.W-1} WeldNet Transcoders")
     for w in range(self.W - 1):
       if len(self.transcoders) <= w:
         self.transcoders.append(self.transclass(**self.transparams))
@@ -1701,7 +1772,7 @@ class WeldNet(WindowTrajectory):
 
       trans = self.transcoders[w]
       opt = optim(trans.parameters(), lr=lr, weight_decay=ridge)
-      scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30)
+      scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
 
       dataloader = DataLoader(train, shuffle=False, batch_size=batch)
 
@@ -1752,8 +1823,10 @@ class WeldNet(WindowTrajectory):
         print("Transcoders saved at", addr)
 
     self.transepochs.append(epochs)
+    end = time.time()
+    self.timetaken += end - start
     print("Finished training all timewindow transcoders")
-    return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf }
+    return { "losses": losses_all, "testerrors1": testerrors1_all, "testerrors2": testerrors2_all, "testerrorsinf": testerrorsinf_all }
 
   def train_transcoders_krr(self, save=True, ridge=1.0, kernel="rbf", gamma=None, encoding_param=-1, printinterval=1):
     encoding_param = determine_param(self.dataset, encoding_param)
@@ -1762,6 +1835,7 @@ class WeldNet(WindowTrajectory):
     testerrors2_all = []
     testerrorsinf_all = []
 
+    start = time.time()
     print(f"Training {self.W} WeldNet Transcoders via Kernel Ridge Regression")
     for w in range(self.W - 1):   
         data_train_raw = torch.tensor(
@@ -1835,6 +1909,8 @@ class WeldNet(WindowTrajectory):
     if save and False:
       pass
 
+    end = time.time()
+    self.timetaken += end - start
     print("Finished training all timewindow transcoders using KRR")
     return {
       "testerrors1": testerrors1_all,
@@ -1860,37 +1936,17 @@ class WeldNet(WindowTrajectory):
           xt = x
 
         if self.accumulateprop:
-          # x0 = x[:, :1]
+          x0 = xt[:, :1]
 
-          # xlist = []
-          # for i in range(x.shape[1]):
-          #   if self.residualprop:
-          #     x0 = x0 + model(x0)
-          #   else:
-          #     x0 = model(x0)
+          xlist = []
+          for _ in range(xt.shape[1]):
+            x0 = self.prop_forward(model, x0)
+            xlist.append(x0)
 
-          #   xlist.appendtransepoch(x0)
-
-          # predict = torch.cat(xlist, dim=1)
-
-          xt = xt[:, :-1]
-          x = x[:, :-1]
-          predict = model(xt)
-          if self.residualprop:
-            predict = x + predict
-
-          predict2 = model(predict)
-          if self.residualprop:
-            predict2 = predict + predict2
-
-          predict = predict2
-          y = y[:, 1:]
+          predict = torch.cat(xlist, dim=1)
 
         else:
           predict = self.prop_forward(model, x)
-          
-          # if self.passparams:
-          #   y = y[..., :-self.dataset.params.shape[1]]
 
         if self.decodedprop:
           decoder = self.aes[w]
@@ -1964,6 +2020,9 @@ class WeldNet(WindowTrajectory):
     encoding_param = determine_param(self.dataset, encoding_param)
 
     losses_all, testerrors1_all, testerrors2_all, testerrorsinf_all = [], [], [], []
+   
+    start = time.time()
+    print(f"Training {self.W} WeldNet Propagators")
     for w in range(self.W):
       if len(self.props) <= w:
         self.props.append(self.propclass(**self.propparams) if self.propclass not in JC_MODULES else propclass(propclass.copy()))
@@ -1982,7 +2041,7 @@ class WeldNet(WindowTrajectory):
 
       prop = self.props[w]
       opt = optim(prop.parameters(), lr=lr, weight_decay=ridge)
-      scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30)
+      scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
                                       
       dataloader = DataLoader(encoded, batch_size=batch)
       writer = None
@@ -2014,13 +2073,16 @@ class WeldNet(WindowTrajectory):
       with open(addr, "wb") as handle:
         pickle.dump({"props": self.props, "propdata": self.propdata, "datadata": self.datadata, "aedata": self.aedata, "aes": self.aes}, handle, protocol=pickle.HIGHEST_PROTOCOL)
         print("Propagators saved at", addr)
-
+    
+    end = time.time()
+    self.timetaken += end - start
+    
     self.propepochs.append(epochs)
     print("Finished training all propagators")
 
     return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf}
 
-  def load_models(self, filename_prefix, directory="weld", verbose=False, min_epochs=0, together=False):
+  def load_models(self, filename_prefix, verbose=False, min_epochs=0, together=False):
     search_path = f"savedmodels/{'weldtogether' if together else 'weld'}/{filename_prefix}*.pickle"
 
     matching_files = glob.glob(search_path)
@@ -2066,8 +2128,9 @@ class WeldNet(WindowTrajectory):
           self.aes = dic["aes"]
           self.props = dic["props"]
           self.transcoders = dic["trans"]
+          self.timetaken = dic["timetaken"]
 
-          self.metadata["epochs"] = meta.get("epochs")
+          self.epochs = model_epochs
 
           return True
       elif verbose:
@@ -2127,7 +2190,8 @@ class WeldNet(WindowTrajectory):
             "aeepochs": self.aeepochs,
             "propepochs": self.propepochs, 
             "transepochs": self.transepochs,
-            "metadata": self.metadata
+            "metadata": self.metadata,
+            "timetaken": self.timetaken
         }, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     print("Models saved at", addr)    
@@ -2153,6 +2217,8 @@ class TimeInputHelper():
     seed = args.get("seed", 0)
     device = args.get("device", 0)
     k = args.get("k", None)
+
+    useparams = args.get("useparams", False)
 
     ticlass = args.get("ticlass", config.ticlass)
     if ticlass == "DeepONet":
@@ -2181,14 +2247,14 @@ class TimeInputHelper():
 
     activation = get_activation(args.get("activation", config.activation))
 
-    return TimeInputModel(dataset, ticlass, tiinfo, activation, td=td, seed=seed, device=device)
+    return TimeInputModel(dataset, ticlass, tiinfo, activation, td=td, seed=seed, device=device, useparams=useparams)
 
   @staticmethod
-  def get_operrs(ti, times=None, testonly=False):
+  def get_operrs(ti, times=None, testonly=True):
     if testonly:
-      data = ti.dataset.data[ti.numtrain:,]
+      data = ti.trainarr
     else:
-      data = ti.dataset.data
+      data = np.concatenate((ti.trainarr, ti.testarr), axis=0)
 
     if isinstance(ti, TimeInputModel):
       errors = ti.get_ti_errors(data, times=times, aggregate=False)
@@ -2197,22 +2263,29 @@ class TimeInputHelper():
     return errors
   
   @staticmethod
-  def plot_op_predicts(ti: TimeInputModel, testonly=False, xs=None, cmap="viridis"):
+  def plot_op_predicts(ti: TimeInputModel, testonly=True, xs=None, cmap="viridis"):
     if testonly:
-      data = ti.dataset.data[ti.numtrain:,]
+      data = ti.trainarr
     else:
-      data = ti.dataset.data
+      data = np.concatenate((ti.trainarr, ti.testarr), axis=0)
 
-    if xs == None:
-      xs = np.linspace(0, 1, len(data[0, 0]))
+    if xs is None:
+      if ti.useparams:
+        xs = np.linspace(0, 1, data.shape[2] - ti.dataset.params.shape[1])
+      else:
+        xs = np.linspace(0, 1, data.shape[2])
 
     data = torch.tensor(np.float32(data)).to(ti.device)
 
-    times = range(1, ti.T)
-    predicts = ti.forward(data[:, 0], times)
+    times = torch.arange(1, ti.T)
+    tt = times.to(ti.device) / ti.T
+    predicts = ti.forward(data[:, 0], tt)
     
     predicts = predicts.cpu().detach()
     data = data.cpu().detach()
+
+    if ti.useparams:
+      data = data[..., :-ti.dataset.params.shape[1]]
 
     errors = []
     n = predicts.shape[0]
@@ -2419,7 +2492,6 @@ class WeldHelper():
     if tiprop:
       propparams["seq"][0] = propparams["seq"][-1] + 1
 
-
     return WeldNet(dataset, windows, aeclass, aeparams.copy(), seqclass, propparams, seqclass, copy.deepcopy(seqparams), passparams=passparams, straightness=straightness,accumulateprop=accumulateprop, decodedprop=decodedprop, kinetic=kinetic, td=td, seed=seed, device=device, autonomous=autonomous)
     #return WeldNet(dataset, windows, aeclass, aeparams, seqclass, seqparams, seqclass, seqparams, straightness=straightness, accumulateprop=accumulateprop, decodedprop=decodedprop, kinetic=kinetic, td=td, seed=seed, device=device, autonomous=autonomous)
   
@@ -2516,7 +2588,7 @@ class WeldHelper():
     if testonly:
       dataset = weld.alltest
     else:
-      dataset = np.concatenate([weld.tests[w], weld.trains[w].cpu().numpy()]) 
+      dataset = np.concatenate([weld.alltest, weld.alltrain]) 
 
     for t in ts:
       w = weld.find_window(t)
@@ -2740,13 +2812,19 @@ class WeldHelper():
 
     assert(t + steps < weld.T)
 
-    if testonly:
-      data = weld.dataset.data[weld.numtrain:,]
-    else:
-      data = weld.dataset.data
+    data = weld.dataset.data
 
     if xs is None:
       xs = np.linspace(0, 1, data.shape[2])
+
+    if weld.passparams:
+      T = data.shape[1] 
+    
+      params = np.repeat(weld.dataset.params[:, None, :], T, axis=1)
+      data = np.concatenate([data, params], axis=-1)
+
+    if testonly:
+      data = data[weld.numtrain:,]
 
     input = torch.tensor(data[:, t, :]).to(weld.device, dtype=torch.float32)
     references = [data[:, t+s+1, :] for s in range(steps)]
@@ -2759,6 +2837,10 @@ class WeldHelper():
     input = input.cpu().detach().numpy()
 
     errors = []
+
+    if weld.passparams:
+      references = [x[..., :-weld.dataset.params.shape[1]] for x in references]
+      input = input[..., :-weld.dataset.params.shape[1]]
     
     n = predictedvals[0].shape[0]
     for s in range(1, steps+1):
@@ -2818,11 +2900,19 @@ class WeldHelper():
     if xs is None:
       xs = np.linspace(0, 1, data.shape[2])
 
+    if weld.passparams:
+      T = weld.dataset.data.shape[1] 
+      params = np.repeat(weld.dataset.params[:, None, :], T, axis=1)
+      data = np.concatenate([data, params], axis=-1)
+
     exacts = [torch.tensor(data[:, i, :]).to(weld.device, dtype=torch.float32) for i in range(data.shape[1])]
     projecteds = [weld.project_window(weld.find_window(i), exacts[i]).cpu().detach().numpy() for i in range(len(exacts))]
     exacts = [x.cpu().detach().numpy() for x in exacts]
 
     errors = []
+
+    if weld.passparams:
+      exacts = [x[..., :-weld.dataset.params.shape[1]] for x in exacts]
     
     for s in range(weld.T):
       exact = exacts[s]
@@ -2881,6 +2971,12 @@ class WeldHelper():
       data = weld.dataset.data
       params = weld.dataset.params
 
+    if weld.passparams:
+      T = data.shape[1] 
+    
+      params = np.repeat(params[:, None, :], T, axis=1)
+      data = np.concatenate([data, params], axis=-1)
+
     reference = torch.tensor(data[:, t+steps, :]).to(weld.device, dtype=torch.float32)
 
     window = weld.find_window(t)
@@ -2895,6 +2991,9 @@ class WeldHelper():
     predicted = predicted.cpu().detach().numpy()
     correct = correct.cpu().detach().numpy()
     reference = reference.cpu().detach().numpy()
+
+    if weld.passparams:
+      reference = reference[..., :-weld.dataset.params.shape[1]]
 
     error = np.mean(np.linalg.norm(predictedvals - reference, axis=1) / np.linalg.norm(reference, axis=1))
     print(f"Relative L2 Error for t{t} to t{t+steps}", error)
@@ -2924,11 +3023,11 @@ class WeldHelper():
     ax.legend()
 
   @staticmethod
-  def plot_projops(weld, title="", save=False):
+  def plot_projops(weld, title="", save=False, testonly=True):
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    projerrs = WeldHelper.get_projerr_times(weld)
-    operrs = WeldHelper.get_operrs(weld)
+    projerrs = WeldHelper.get_projerr_times(weld, testonly=testonly)
+    operrs = WeldHelper.get_operrs(weld, testonly=testonly)
 
     ax.plot(range(len(projerrs)), projerrs, label="Reconstruction Error")
     ax.plot(range(1, len(operrs)+1), operrs, label="Operator Error")
@@ -3048,15 +3147,22 @@ class WeldHelper():
     return fig
 
   @staticmethod
-  def plot_latent_trajectory(self, testnums, t=0, steps=-1, threed=False, figax=None):
+  def plot_latent_trajectory(weld, testnums, t=0, steps=-1, threed=False, figax=None):
     shapes = ["*"]
     shapesactual = ["o"]
     if steps == -1:
-      steps = self.T - t - 1
+      steps = weld.T - t - 1
 
-    arr = torch.tensor(self.dataset.data[testnums, :, :]).to(self.device, dtype=torch.float32)
-    outlist = self.propagate(arr[:, t, :], t, steps)
-    actual = [self.encode_window(self.find_window(tt), arr[:, tt, :]) for tt in range(t + 1, t + steps + 1)]
+    data = weld.dataset.data
+    if weld.passparams:
+      T = weld.dataset.data.shape[1] 
+    
+      params = np.repeat(weld.dataset.params[:, None, :], T, axis=1)
+      data = np.concatenate([data, params], axis=-1)
+
+    arr = torch.tensor(data[testnums, :, :]).to(weld.device, dtype=torch.float32)
+    outlist = weld.propagate(arr[:, t, :], t, steps)
+    actual = [weld.encode_window(weld.find_window(tt), arr[:, tt, :]) for tt in range(t + 1, t + steps + 1)]
     
     actualpoints = torch.stack(actual, dim=2).cpu().detach()
     points = torch.stack(outlist, dim=2).cpu().detach()
@@ -3098,6 +3204,13 @@ class WeldHelper():
         steps = weld.windowvals[w][-1]
 
       data = weld.dataset.data
+
+      if weld.passparams:
+        T = data.shape[1] 
+      
+        params = np.repeat(weld.dataset.params[:, None, :], T, axis=1)
+        data = np.concatenate([data, params], axis=-1)
+
       if num is None:
         num = np.random.randint(data.shape[0])
 
@@ -3187,6 +3300,2079 @@ class WeldHelper():
 
     fig.tight_layout()
     return fig
+
+class LDHelper():
+  def __init__(self, config):
+    self.update_config(config)
+
+  def update_config(self, config):
+    self.config = deepcopy(config)
+
+  def create_ldnet(self, dataset, k, config=None, **args):
+    if config is None:
+      config = self.config
+
+    assert(len(dataset.data.shape) < 4)
+    if len(dataset.data.shape) == 3:
+      din = dataset.params.shape[-1]
+      dout = dataset.data.shape[-1]
+
+    td = args.get("td", None)
+    seed = args.get("seed", 0)
+    device = args.get("device", 0)
+
+    dynclass = globals()[args.get("dynclass", config.dynclass)]
+    dynparams = copy.deepcopy(dict(args.get("dynparams", config.dynparams)))
+    decclass = globals()[args.get("decclass", config.decclass)]
+    recparams = copy.deepcopy(dict(args.get("recparams", config.recparams)))
+
+    dynparams["seq"][0] = k + din
+    dynparams["seq"][-1] = k
+    recparams["seq"][0] = k + din
+    recparams["seq"][-1] = dout
+
+    return LDNet(dataset, k, dynclass, dynparams, decclass, recparams, td=td, seed=seed, device=device)
+
+  @staticmethod
+  def get_operrs(ldnet, times=None, testonly=False):
+    if testonly:
+      data = ldnet.testarr
+      params = ldnet.testparams
+    else:
+      data = np.concatenate((ldnet.trainarr, ldnet.testarr), axis=0)
+      params = np.concatenate((ldnet.trainparams, ldnet.testparams), axis=0)
+    
+    errors = ldnet.get_errors(data, params, times=times, aggregate=False)
+
+    return errors
+  
+  @staticmethod
+  def plot_op_predicts(ldnet, testonly=False, xs=None, cmap="viridis"):
+    if testonly:
+      data = ldnet.dataset.data[ldnet.numtrain:,]
+      params = ldnet.dataset.params[ldnet.numtrain:,]
+    else:
+      data = ldnet.dataset.data
+      params = ldnet.dataset.params
+
+    if xs == None:
+      xs = np.linspace(0, 1, len(data[0, 0]))
+
+    params = torch.tensor(np.float32(params)).to(ldnet.device)
+
+    predicts = ldnet.propagate(params).cpu().detach()
+
+    errors = []
+    n = predicts.shape[0]
+    for s in range(data.shape[1]):
+      currpredict = predicts[:, s-1].reshape((n, -1))
+      currreference = data[:, s].reshape((n, -1))
+      errors.append(np.mean(np.linalg.norm(currpredict - currreference, axis=1) / np.linalg.norm(currreference, axis=1)))
+        
+    print(f"Average Relative L2 Error over all times: {np.mean(errors):.4f}")
+
+    if len(data.shape) == 3:
+      fig, ax = plt.subplots(figsize=(4, 3))
+
+    @widgets.interact(i=(0, n-1), s=(1, ldnet.T-1))
+    def plot_interact(i=0, s=1):
+      print(f"Avg Relative L2 Error for t0 to t{s}: {errors[s-1]:.4f}")
+
+      if len(data.shape) == 3:
+        ax.clear()
+        ax.set_title(f"RelL2 {np.linalg.norm(predicts[i, s-1] - data[i, s]) / np.linalg.norm(data[i, s])}")
+        ax.plot(xs, data[i, 0], label="Input", linewidth=1)
+        ax.plot(xs, predicts[i, s-1], label="Predicted", linewidth=1)
+        ax.plot(xs, data[i, s], label="Exact", linewidth=1)
+        ax.legend()
+        
+  @staticmethod
+  def plot_errorparams(ldnet, param=-1):
+    if param == -1:
+        # Auto-detect one varying parameter
+        param = 0
+        P = ldnet.dataset.params.shape[1]
+        for p in range(P):
+            if np.abs(ldnet.dataset.params[0, p] - ldnet.dataset.params[1, p]) > 0:
+                param = p
+                break
+
+    l2error = np.asarray(LDHelper.get_operrs(ldnet, times=[ldnet.T - 1]))
+    params = ldnet.dataset.params
+
+    print(params.shape, l2error.shape)
+
+    if isinstance(param, (list, tuple, np.ndarray)) and len(param) == 2:
+        # 3D scatter plot for 2 varying parameters
+        x = params[:, param[0]]
+        y = params[:, param[1]]
+        z = l2error
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        sc = ax.scatter(x, y, z, c=z, cmap='viridis', s=10)
+
+        ax.set_xlabel(f"Param {param[0]}")
+        ax.set_ylabel(f"Param {param[1]}")
+        ax.set_zlabel("Operator Error")
+        fig.colorbar(sc, ax=ax, label="Operator Error")
+
+    else:
+        # Fallback to 2D scatter if param is 1D
+        fig, ax = plt.subplots()
+        ax.scatter(params[:, param], l2error, s=2)
+        ax.set_xlabel(f"Parameter {param}")
+        ax.set_ylabel("Operator Error")
+
+    fig.tight_layout()
+
+class LDNet():
+  def __init__(self, dataset, k, dynclass, dynparams, decclass, recparams, td, seed, device):
+    self.dataset = dataset
+    self.device = device
+    self.td = td
+    self.k = k
+    self.f = self.dataset.params.shape[1]
+  
+    if self.td is None:
+      self.prefix = f"{self.dataset.name}{str(dynclass.__name__)}LDNet-{dynparams['seq'][-1]}"
+    else:
+      self.prefix = self.td
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    self.seed = seed
+
+    self.timetaken = 0
+
+    datacopy = self.dataset.data.copy()
+    self.numtrain = int(datacopy.shape[0] * 0.8)
+    
+    self.T = self.dataset.data.shape[1]
+    self.trainarr = datacopy[:self.numtrain]
+    self.testarr = datacopy[self.numtrain:]
+    self.trainparams = self.dataset.params[:self.numtrain]
+    self.testparams = self.dataset.params[self.numtrain:]
+    self.optparams = None
+
+    self.datadim = len(self.dataset.data.shape) - 2
+
+    self.dynclass = dynclass
+    self.dynparams = copy.deepcopy(dynparams)
+    self.decclass = decclass
+    self.recparams = copy.deepcopy(recparams)
+
+    dynparams["seq"][0] = self.k + self.f
+    dynparams["seq"][-1] = self.k
+    recparams["seq"][0] = self.k + self.f
+    recparams["seq"][-1] = self.dataset.data.shape[-1]
+
+    self.dynnet = dynclass(**dynparams).float().to(device)
+    self.recnet = decclass(**recparams).float().to(device)
+
+    self.metadata = {
+      "dynclass": dynclass.__name__,
+      "dynparams": dynparams,
+      "decclass": decclass.__name__,
+      "recparams": recparams,
+      "dataset_name": dataset.name,
+      "data_shape": list(dataset.data.shape),
+      "data_checksum": float(np.sum(dataset.data)),
+      "seed": seed,
+    }
+
+    self.epochs = []
+
+  def propagate(self, code, start=0, end=-1, returncodes=False):
+    if end == -1:
+      end = self.T - 1
+
+    z = code
+
+    # get first decode
+    if z.shape[-1] != self.f + self.k:
+      if z.shape[-1] == self.f:
+        z_fixed = z
+        z_dynamic = torch.zeros(list(z_fixed.shape[:-1]) + [self.k])
+        z = torch.cat([z_fixed, z_dynamic], dim=-1)
+      else:
+        print(z.shape)
+        assert(False)
+
+    zpreds = [z]
+    for t in range(start, end):
+      z = self.forward(z)
+      zpreds.append(z)
+
+    zpreds = torch.stack(zpreds, dim=1)
+    upreds = self.recnet(zpreds)
+
+    if returncodes:
+      return upreds, zpreds
+    else:
+      return upreds
+
+  def get_errors(self, testarr, testparams, ords=(2,), times=None, aggregate=True):
+    assert(aggregate or len(ords) == 1)
+    
+    if isinstance(testarr, np.ndarray):
+      testarr = torch.tensor(testarr, dtype=torch.float32)
+
+    if isinstance(testparams, np.ndarray):
+      testparams = torch.tensor(testparams, dtype=torch.float32)
+
+    if times is None:
+      times = range(self.T-1)
+  
+    out = self.propagate(testparams)
+
+    n = testarr.shape[0]
+    orig = testarr.cpu().detach().numpy()
+    out = out.cpu().detach().numpy()
+
+    if aggregate:
+      orig = orig.reshape([n, -1])
+      out = out.reshape([n, -1])
+      testerrs = []
+      for o in ords:
+        testerrs.append(np.mean(np.linalg.norm(orig - out, axis=1, ord=o) / np.linalg.norm(orig, axis=1, ord=o)))
+
+      return tuple(testerrs)
+    
+    else:
+      o = ords[0]
+      testerrs = []
+
+      if len(times) == 1:
+        t = times[0]
+        origslice = orig[:, t].reshape([n, -1])
+        outslice = out[:, t].reshape([n, -1])
+        return np.linalg.norm(origslice - outslice, axis=1, ord=o) / np.linalg.norm(origslice, axis=1, ord=o)
+      else:
+        for t in range(orig.shape[1]):
+          origslice = orig[:, t].reshape([n, -1])
+          outslice = out[:, t].reshape([n, -1])
+          testerrs.append(np.mean(np.linalg.norm(origslice - outslice, axis=1, ord=o) / np.linalg.norm(origslice, axis=1, ord=o)))
+
+        return testerrs
+
+  def forward(self, z_full, decode=False):
+    if z_full.shape[-1] == self.f + self.k:
+      z_fixed = z_full[..., :self.f]
+      z_dynamic = z_full[..., self.f:]
+
+    else:
+      if z_full.shape[-1] == self.f:
+        z_fixed = z_full
+        z_dynamic = torch.zeros(list(z_fixed.shape[:-1]) + [self.k])
+        z_full = torch.cat([z_fixed, z_dynamic], dim=-1)
+      else:
+        print(z_full.shape)
+        assert(False)
+
+    deltaz = self.dynnet(z_full)
+    z_next_dynamic = z_dynamic + deltaz
+    z_next_full = torch.cat([z_fixed, z_next_dynamic], dim=-1)
+
+    if decode:
+      decoded = self.recnet(z_next_full)
+      return decoded, z_next_full
+    
+    else:
+      return z_next_full
+
+  def load_model(self, filename_prefix, verbose=False, min_epochs=0):
+    search_path = f"savedmodels/ldnet/{filename_prefix}*.pickle"
+    matching_files = glob.glob(search_path)
+
+    print("Searching for model files matching prefix:", filename_prefix)
+    if not hasattr(self, "metadata"):
+        raise ValueError("Missing self.metadata. Cannot match models without metadata. Ensure model has been initialized with same config.")
+
+    for addr in matching_files:
+      try:
+          with open(addr, "rb") as handle:
+              dic = pickle.load(handle)
+      except Exception as e:
+          if verbose:
+              print(f"Skipping {addr} due to read error: {e}")
+          continue
+
+      meta = dic.get("metadata", {})
+      is_match = all(
+          meta.get(k) == self.metadata.get(k)
+          for k in self.metadata.keys()
+      )
+
+      # Check if model meets the minimum epoch requirement
+      model_epochs = dic["epochs"]
+      if model_epochs is None:
+          if verbose:
+              print(f"Skipping {addr} due to missing epoch metadata.")
+          continue
+      elif isinstance(model_epochs, list):  # handle legacy or list format
+          if sum(model_epochs) < min_epochs:
+              if verbose:
+                  print(f"Skipping {addr} due to insufficient epochs ({sum(model_epochs)} < {min_epochs})")
+              continue
+      elif model_epochs < min_epochs:
+          if verbose:
+              print(f"Skipping {addr} due to insufficient epochs ({model_epochs} < {min_epochs})")
+          continue
+
+      if is_match:
+          print("Model match found. Loading from:", addr)
+          self.dynnet.load_state_dict(dic["dynnet"])
+          self.recnet.load_state_dict(dic["recnet"])
+          self.epochs = model_epochs
+          self.timetaken = dic["timetaken"]
+          if "opt" in dic:     
+            self.optparams = dic["opt"]
+
+          return True
+      elif verbose:
+          print("Metadata mismatch in file:", addr)
+          for k in self.metadata:
+              print(f"{k}: saved={meta.get(k)} vs current={self.metadata.get(k)}")
+
+    print("Load failed. No matching models found.")
+    print("Searched:", matching_files)
+    return False
+
+  def train_model(self, epochs, save=True, optim=torch.optim.AdamW, lr=1e-4, printinterval=10, batch=32, ridge=0, loss=None, best=True, verbose=False):
+    def train_epoch(dataloader, writer=None, optimizer=None, scheduler=None, ep=0, printinterval=10, loss=None, testarr=None, testparams=None):
+      losses = []
+      testerrors1 = []
+      testerrors2 = []
+      testerrorsinf = []
+
+      def closure(values, params):
+        optimizer.zero_grad()
+
+        out = self.propagate(params)
+        target = values
+        
+        res = loss(out, target)
+        res.backward()
+        
+        if writer is not None and self.trainstep % 5 == 0:
+          writer.add_scalar("main/loss", res, global_step=self.trainstep)
+
+        return res
+
+      for values, params in dataloader:
+        self.trainstep += 1
+        error = optimizer.step(lambda: closure(values, params))
+        losses.append(float(error.cpu().detach()))
+
+      if scheduler is not None:
+        scheduler.step(np.mean(losses))
+
+      # print test
+      if printinterval > 0 and (ep % printinterval == 0):
+        testerr1, testerr2, testerrinf = self.get_errors(testarr, testparams, ords=(1, 2, np.inf))
+        if scheduler is not None:
+          print(f"{ep+1}: Train Loss {error:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative LDNet Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+        else:
+          print(f"{ep+1}: Train Loss {error:.3e}, Relative LDNet Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+
+        if writer is not None:
+            writer.add_scalar("misc/relativeL1error", testerr1, global_step=ep)
+            writer.add_scalar("main/relativeL2error", testerr2, global_step=ep)
+            writer.add_scalar("misc/relativeLInferror", testerrinf, global_step=ep)
+
+      return losses, testerrors1, testerrors2, testerrorsinf
+  
+    loss = nn.MSELoss() if loss is None else loss()
+
+    losses, testerrors1, testerrors2, testerrorsinf = [], [], [], []
+    self.trainstep = 0
+
+    train = torch.tensor(self.trainarr, dtype=torch.float32).to(self.device)
+    params = torch.tensor(self.trainparams, dtype=torch.float32).to(self.device)
+    test = self.testarr
+
+    opt = optim(itertools.chain(self.dynnet.parameters(), self.recnet.parameters()), lr=lr, weight_decay=ridge)
+    scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
+    dataloader = DataLoader(torch.utils.data.TensorDataset(train, params), shuffle=False, batch_size=batch)
+
+    if self.optparams is not None:
+      opt.load_state_dict(self.optparams)
+
+    writer = None
+    if self.td is not None:
+      name = f"./tensorboard/{datetime.datetime.now().strftime('%d-%B-%Y')}/{self.td}/{datetime.datetime.now().strftime('%H.%M.%S')}/"
+      writer = torch.utils.tensorboard.SummaryWriter(name)
+      print("Tensorboard writer location is " + name)
+
+    print("Number of NN trainable parameters", utils.num_params(self.dynnet), "+", utils.num_params(self.recnet))
+    print(f"Starting training LDNet model at {time.asctime()}...")
+    print("train", train.shape, "test", test.shape)
+      
+    start = time.time()
+    bestdict = { "loss": float(np.inf), "ep": 0 }
+    for ep in range(epochs):
+      lossesN, testerrors1N, testerrors2N, testerrorsinfN = train_epoch(dataloader, optimizer=opt, scheduler=scheduler, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test, testparams=self.testparams)
+      losses += lossesN; testerrors1 += testerrors1N; testerrors2 += testerrors2N; testerrorsinf += testerrorsinfN
+
+      if best and ep > epochs // 2:
+        avgloss = np.mean(lossesN)
+        if avgloss < bestdict["loss"]:
+          bestdict["dynnet"] = self.dynnet.state_dict()
+          bestdict["recnet"] = self.recnet.state_dict()
+          bestdict["opt"] = opt.state_dict()
+          bestdict["loss"] = avgloss
+          bestdict["ep"] = ep
+        elif verbose:
+          print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
+    
+    end = time.time()
+    self.timetaken += end - start
+    print(f"Finished training LDNet model at {time.asctime()}...")
+    
+
+    if best:
+      self.dynnet.load_state_dict(bestdict["dynnet"])
+      self.recnet.load_state_dict(bestdict["recnet"])
+      opt.load_state_dict(bestdict["opt"])
+
+    self.optparams = opt.state_dict()
+    self.epochs.append(epochs)
+
+    if save:
+      now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+      # Compute total training epochs
+      total_epochs = sum(self.epochs) if isinstance(self.epochs, list) else self.epochs
+
+      filename = (
+          f"{self.dataset.name}_"
+          f"{self.dynclass.__name__}_"
+          f"{self.dynparams['seq']}_"
+          f"{self.decclass.__name__}_"
+          f"{self.recparams['seq']}_"
+          f"{self.seed}_"
+          f"{total_epochs}ep_"
+          f"{now}.pickle"
+      )
+
+      dire = "savedmodels/ldnet"
+      addr = os.path.join(dire, filename)
+
+      if not os.path.exists(dire):
+          os.makedirs(dire)
+
+      with open(addr, "wb") as handle:
+          pickle.dump({
+              "dynnet": self.dynnet.state_dict(),
+              "recnet": self.recnet.state_dict(),
+              "metadata": self.metadata,
+              "opt": self.optparams,
+              "epochs": self.epochs,
+              "timetaken": self.timetaken
+          }, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+      print("Model saved at", addr)
+
+    return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf }
+
+class LTIHelper():
+  def __init__(self, config):
+    self.update_config(config)
+
+  def update_config(self, config):
+    self.config = deepcopy(config)
+
+  def create_ltinet(self, dataset, config=None, **args):
+    if config is None:
+      config = self.config
+
+    assert(len(dataset.data.shape) < 4)
+    if len(dataset.data.shape) == 3:
+      din = dataset.params.shape[-1]
+      dout = dataset.data.shape[-1]
+
+    td = args.get("td", None)
+    seed = args.get("seed", 0)
+    device = args.get("device", 0)
+
+    recclass = globals()[args.get("recclass", config.recclass)]
+    recparams = copy.deepcopy(dict(args.get("recparams", config.recparams)))
+
+    recparams["seq"][0] = din + 1
+    recparams["seq"][-1] = dout
+
+    return LTINet(dataset, recclass, recparams, td=td, seed=seed, device=device)
+
+  @staticmethod
+  def get_operrs(ltinet, times=None, testonly=False):
+    if testonly:
+      data = ltinet.testarr
+      params = ltinet.testparams
+    else:
+      data = np.concatenate((ltinet.trainarr, ltinet.testarr), axis=0)
+      params = np.concatenate((ltinet.trainparams, ltinet.testparams), axis=0)
+
+    errors = ltinet.get_errors(data, params, times=times, aggregate=False)
+
+    return errors
+  
+  @staticmethod
+  def plot_op_predicts(ltinet, testonly=False, xs=None, cmap="viridis"):
+    if testonly:
+      data = ltinet.dataset.data[ltinet.numtrain:,]
+      params = ltinet.dataset.params[ltinet.numtrain:,]
+    else:
+      data = ltinet.dataset.data
+      params = ltinet.dataset.params
+
+    if xs == None:
+      xs = np.linspace(0, 1, len(data[0, 0]))
+
+    params = torch.tensor(np.float32(params)).to(ltinet.device)
+
+    predicts = ltinet.propagate(params).cpu().detach()
+
+    errors = []
+    n = predicts.shape[0]
+    for s in range(data.shape[1]):
+      currpredict = predicts[:, s-1].reshape((n, -1))
+      currreference = data[:, s].reshape((n, -1))
+      errors.append(np.mean(np.linalg.norm(currpredict - currreference, axis=1) / np.linalg.norm(currreference, axis=1)))
+        
+    print(f"Average Relative L2 Error over all times: {np.mean(errors):.4f}")
+
+    if len(data.shape) == 3:
+      fig, ax = plt.subplots(figsize=(4, 3))
+
+    @widgets.interact(i=(0, n-1), s=(1, ltinet.T-1))
+    def plot_interact(i=0, s=1):
+      print(f"Avg Relative L2 Error for t0 to t{s}: {errors[s-1]:.4f}")
+
+      if len(data.shape) == 3:
+        ax.clear()
+        ax.set_title(f"RelL2 {np.linalg.norm(predicts[i, s-1] - data[i, s]) / np.linalg.norm(data[i, s])}")
+        ax.plot(xs, data[i, 0], label="Input", linewidth=1)
+        ax.plot(xs, predicts[i, s-1], label="Predicted", linewidth=1)
+        ax.plot(xs, data[i, s], label="Exact", linewidth=1)
+        ax.legend()
+        
+  @staticmethod
+  def plot_errorparams(ltinet, param=-1):
+    if param == -1:
+        # Auto-detect one varying parameter
+        param = 0
+        P = ltinet.dataset.params.shape[1]
+        for p in range(P):
+            if np.abs(ltinet.dataset.params[0, p] - ltinet.dataset.params[1, p]) > 0:
+                param = p
+                break
+
+    l2error = np.asarray(LTIHelper.get_operrs(ltinet, times=[ltinet.T - 1]))
+    params = ltinet.dataset.params
+
+    print(params.shape, l2error.shape)
+
+    if isinstance(param, (list, tuple, np.ndarray)) and len(param) == 2:
+        # 3D scatter plot for 2 varying parameters
+        x = params[:, param[0]]
+        y = params[:, param[1]]
+        z = l2error
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        sc = ax.scatter(x, y, z, c=z, cmap='viridis', s=10)
+
+        ax.set_xlabel(f"Param {param[0]}")
+        ax.set_ylabel(f"Param {param[1]}")
+        ax.set_zlabel("Operator Error")
+        fig.colorbar(sc, ax=ax, label="Operator Error")
+
+    else:
+        # Fallback to 2D scatter if param is 1D
+        fig, ax = plt.subplots()
+        ax.scatter(params[:, param], l2error, s=2)
+        ax.set_xlabel(f"Parameter {param}")
+        ax.set_ylabel("Operator Error")
+
+    fig.tight_layout()
+
+class LTINet():
+  def __init__(self, dataset, recclass, recparams, td, seed, device):
+    self.dataset = dataset
+    self.device = device
+    self.td = td
+    self.f = self.dataset.params.shape[1]
+  
+    self.timetaken = 0
+
+    if self.td is None:
+      self.prefix = f"{self.dataset.name}{str(recclass.__name__)}LTINet"
+    else:
+      self.prefix = self.td
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    self.seed = seed
+
+    datacopy = self.dataset.data.copy()
+    self.numtrain = int(datacopy.shape[0] * 0.8)
+    
+    self.T = self.dataset.data.shape[1]
+    self.trainarr = datacopy[:self.numtrain]
+    self.testarr = datacopy[self.numtrain:]
+    self.trainparams = self.dataset.params[:self.numtrain]
+    self.testparams = self.dataset.params[self.numtrain:]
+    self.optparams = None
+
+    self.datadim = len(self.dataset.data.shape) - 2
+
+    self.recclass = recclass
+    self.recparams = copy.deepcopy(recparams)
+
+    recparams["seq"][0] = self.f + 1
+    recparams["seq"][-1] = self.dataset.data.shape[-1]
+
+    self.recnet = recclass(**recparams).float().to(device)
+
+    self.metadata = {
+      "recclass": recclass.__name__,
+      "recparams": recparams,
+      "dataset_name": dataset.name,
+      "data_shape": list(dataset.data.shape),
+      "data_checksum": float(np.sum(dataset.data)),
+      "seed": seed,
+    }
+
+    self.epochs = []
+
+  def propagate(self, code, start=0, end=-1):
+    fullts = torch.linspace(0, 1, self.T).float().to(self.device)
+    
+    if end > 0:
+      ts = fullts[start:end+1]
+    else:
+      ts = fullts[start:]
+
+    out = self.forward(code, ts)
+    return out
+
+  def get_errors(self, testarr, testparams, ords=(2,), times=None, aggregate=True):
+    assert(aggregate or len(ords) == 1)
+    
+    if isinstance(testarr, np.ndarray):
+      testarr = torch.tensor(testarr, dtype=torch.float32)
+
+    if isinstance(testparams, np.ndarray):
+      testparams = torch.tensor(testparams, dtype=torch.float32)
+
+    if times is None:
+      times = range(self.T-1)
+  
+    out = self.propagate(testparams)
+
+    n = testarr.shape[0]
+    orig = testarr.cpu().detach().numpy()
+    out = out.cpu().detach().numpy()
+
+    if aggregate:
+      orig = orig.reshape([n, -1])
+      out = out.reshape([n, -1])
+      testerrs = []
+      for o in ords:
+        testerrs.append(np.mean(np.linalg.norm(orig - out, axis=1, ord=o) / np.linalg.norm(orig, axis=1, ord=o)))
+
+      return tuple(testerrs)
+    
+    else:
+      o = ords[0]
+      testerrs = []
+
+      if len(times) == 1:
+        t = times[0]
+        origslice = orig[:, t].reshape([n, -1])
+        outslice = out[:, t].reshape([n, -1])
+        return np.linalg.norm(origslice - outslice, axis=1, ord=o) / np.linalg.norm(origslice, axis=1, ord=o)
+      else:
+        for t in range(orig.shape[1]):
+          origslice = orig[:, t].reshape([n, -1])
+          outslice = out[:, t].reshape([n, -1])
+          testerrs.append(np.mean(np.linalg.norm(origslice - outslice, axis=1, ord=o) / np.linalg.norm(origslice, axis=1, ord=o)))
+
+        return testerrs
+
+  def forward(self, z, ts):
+    z_shape = z.shape
+    *leading_dims, N = z_shape
+    T = ts.shape[0]
+
+    z_expanded = z.unsqueeze(-2).expand(*leading_dims, T, N)
+
+    t_shape = [1] * len(leading_dims) + [T, 1]
+    t_expanded = ts.view(*t_shape).expand(*leading_dims, T, 1)
+
+    result = torch.cat([z_expanded, t_expanded], dim=-1)
+
+    decoded = self.recnet(result)
+    return decoded
+
+  def load_model(self, filename_prefix, verbose=False, min_epochs=0):
+    search_path = f"savedmodels/ltinet/{filename_prefix}*.pickle"
+    matching_files = glob.glob(search_path)
+
+    print("Searching for model files matching prefix:", filename_prefix)
+    if not hasattr(self, "metadata"):
+        raise ValueError("Missing self.metadata. Cannot match models without metadata. Ensure model has been initialized with same config.")
+
+    for addr in matching_files:
+      try:
+          with open(addr, "rb") as handle:
+              dic = pickle.load(handle)
+      except Exception as e:
+          if verbose:
+              print(f"Skipping {addr} due to read error: {e}")
+          continue
+
+      meta = dic.get("metadata", {})
+      is_match = all(
+          meta.get(k) == self.metadata.get(k)
+          for k in self.metadata.keys()
+      )
+
+      # Check if model meets the minimum epoch requirement
+      model_epochs = dic["epochs"]
+      if model_epochs is None:
+          if verbose:
+              print(f"Skipping {addr} due to missing epoch metadata.")
+          continue
+      elif isinstance(model_epochs, list):  # handle legacy or list format
+          if sum(model_epochs) < min_epochs:
+              if verbose:
+                  print(f"Skipping {addr} due to insufficient epochs ({sum(model_epochs)} < {min_epochs})")
+              continue
+      elif model_epochs < min_epochs:
+          if verbose:
+              print(f"Skipping {addr} due to insufficient epochs ({model_epochs} < {min_epochs})")
+          continue
+
+      if is_match:
+          print("Model match found. Loading from:", addr)
+          self.recnet.load_state_dict(dic["recnet"])
+          self.epochs = model_epochs
+          self.timetaken = dic["timetaken"]
+          if "opt" in dic:     
+            self.optparams = dic["opt"]
+
+          return True
+      elif verbose:
+          print("Metadata mismatch in file:", addr)
+          for k in self.metadata:
+              print(f"{k}: saved={meta.get(k)} vs current={self.metadata.get(k)}")
+
+    print("Load failed. No matching models found.")
+    print("Searched:", matching_files)
+    return False
+
+  def train_model(self, epochs, save=True, optim=torch.optim.AdamW, lr=1e-4, printinterval=10, batch=32, ridge=0, loss=None, best=True, verbose=False):
+    def train_epoch(dataloader, writer=None, optimizer=None, scheduler=None, ep=0, printinterval=10, loss=None, testarr=None, testparams=None):
+      losses = []
+      testerrors1 = []
+      testerrors2 = []
+      testerrorsinf = []
+
+      def closure(values, params):
+        optimizer.zero_grad()
+
+        out = self.propagate(params)
+        target = values
+        
+        res = loss(out, target)
+        res.backward()
+        
+        if writer is not None and self.trainstep % 5 == 0:
+          writer.add_scalar("main/loss", res, global_step=self.trainstep)
+
+        return res
+
+      for values, params in dataloader:
+        self.trainstep += 1
+        error = optimizer.step(lambda: closure(values, params))
+        losses.append(float(error.cpu().detach()))
+
+      if scheduler is not None:
+        scheduler.step(np.mean(losses))
+
+      # print test
+      if printinterval > 0 and (ep % printinterval == 0):
+        testerr1, testerr2, testerrinf = self.get_errors(testarr, testparams, ords=(1, 2, np.inf))
+        if scheduler is not None:
+          print(f"{ep+1}: Train Loss {error:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative LTINet Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+        else:
+          print(f"{ep+1}: Train Loss {error:.3e}, Relative LTINet Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+
+        if writer is not None:
+            writer.add_scalar("misc/relativeL1error", testerr1, global_step=ep)
+            writer.add_scalar("main/relativeL2error", testerr2, global_step=ep)
+            writer.add_scalar("misc/relativeLInferror", testerrinf, global_step=ep)
+
+      return losses, testerrors1, testerrors2, testerrorsinf
+  
+    loss = nn.MSELoss() if loss is None else loss()
+
+    losses, testerrors1, testerrors2, testerrorsinf = [], [], [], []
+    self.trainstep = 0
+
+    train = torch.tensor(self.trainarr, dtype=torch.float32).to(self.device)
+    params = torch.tensor(self.trainparams, dtype=torch.float32).to(self.device)
+    test = self.testarr
+
+    opt = optim(self.recnet.parameters(), lr=lr, weight_decay=ridge)
+    scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
+    dataloader = DataLoader(torch.utils.data.TensorDataset(train, params), shuffle=False, batch_size=batch)
+
+    if self.optparams is not None:
+      opt.load_state_dict(self.optparams)
+
+    writer = None
+    if self.td is not None:
+      name = f"./tensorboard/{datetime.datetime.now().strftime('%d-%B-%Y')}/{self.td}/{datetime.datetime.now().strftime('%H.%M.%S')}/"
+      writer = torch.utils.tensorboard.SummaryWriter(name)
+      print("Tensorboard writer location is " + name)
+
+    print("Number of NN trainable parameters", utils.num_params(self.recnet))
+    print(f"Starting training LTINet model at {time.asctime()}...")
+    print("train", train.shape, "test", test.shape)
+    start = time.time()
+      
+    bestdict = { "loss": float(np.inf), "ep": 0 }
+    for ep in range(epochs):
+      lossesN, testerrors1N, testerrors2N, testerrorsinfN = train_epoch(dataloader, optimizer=opt, scheduler=scheduler, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test, testparams=self.testparams)
+      losses += lossesN; testerrors1 += testerrors1N; testerrors2 += testerrors2N; testerrorsinf += testerrorsinfN
+
+      if best and ep > epochs // 2:
+        avgloss = np.mean(lossesN)
+        if avgloss < bestdict["loss"]:
+          bestdict["recnet"] = self.recnet.state_dict()
+          bestdict["opt"] = opt.state_dict()
+          bestdict["loss"] = avgloss
+          bestdict["ep"] = ep
+        elif verbose:
+          print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
+      
+    print(f"Finished training LTINet model at {time.asctime()}...")
+    end = time.time()
+    self.timetaken += end - start
+
+    if best:
+      self.recnet.load_state_dict(bestdict["recnet"])
+      opt.load_state_dict(bestdict["opt"])
+
+    self.optparams = opt.state_dict()
+    self.epochs.append(epochs)
+
+    if save:
+      now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+      # Compute total training epochs
+      total_epochs = sum(self.epochs) if isinstance(self.epochs, list) else self.epochs
+
+      filename = (
+          f"{self.dataset.name}_"
+          f"{self.recclass.__name__}_"
+          f"{self.recparams['seq']}_"
+          f"{self.seed}_"
+          f"{total_epochs}ep_"
+          f"{now}.pickle"
+      )
+
+      dire = "savedmodels/ltinet"
+      addr = os.path.join(dire, filename)
+
+      if not os.path.exists(dire):
+          os.makedirs(dire)
+
+      with open(addr, "wb") as handle:
+          pickle.dump({
+              "recnet": self.recnet.state_dict(),
+              "metadata": self.metadata,
+              "opt": self.optparams,
+              "epochs": self.epochs,
+              "timetaken": self.timetaken
+          }, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+      print("Model saved at", addr)
+
+    return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf }
+
+class ETIHelper():
+  def __init__(self, config):
+    self.update_config(config)
+
+  def update_config(self, config):
+    self.config = deepcopy(config)
+
+  def create_etinet(self, dataset, k, config=None, **args):
+    if config is None:
+      config = self.config
+
+    assert(len(dataset.data.shape) < 4)
+    if len(dataset.data.shape) == 3:
+      din = dataset.params.shape[-1]
+      dout = dataset.data.shape[-1]
+
+    td = args.get("td", None)
+    seed = args.get("seed", 0)
+    device = args.get("device", 0)
+
+    recclass = globals()[args.get("recclass", config.recclass)]
+    recparams = copy.deepcopy(dict(args.get("recparams", config.recparams)))
+
+    aeclass = globals()[args.get("aeclass", config.aeclass)]
+    aeparams = copy.deepcopy(dict(args.get("aeparams", config.aeparams)))
+
+    recparams["seq"][0] = k + 1
+    recparams["seq"][-1] = dout
+
+    return ETINet(dataset, k, aeclass, aeparams, recclass, recparams, td=td, seed=seed, device=device)
+
+  @staticmethod
+  def get_operrs(etinet, times=None, testonly=False):
+    if testonly:
+      data = etinet.dataset.data[etinet.numtrain:,]
+    else:
+      data = etinet.dataset.data
+
+    inputs = torch.tensor(data[:, 0]).to(etinet.device)
+
+    encode = etinet.aenet.encode(inputs)
+    errors = etinet.get_errors(encode, data[:, 1:], times=times, aggregate=False)
+
+    return errors
+  
+  @staticmethod
+  def plot_op_predicts(etinet, testonly=False, xs=None, cmap="viridis", topdown=True):
+    if testonly:
+      data = etinet.dataset.data[etinet.numtrain:,]
+    else:
+      data = etinet.dataset.data
+
+    if xs == None:
+      xs = np.linspace(0, 1, len(data[0, 0]))
+
+    inputs = etinet.aenet.encode(torch.tensor(data[:, 0]).to(etinet.device))
+    predicts = etinet.propagate(inputs).cpu().detach().numpy()
+
+    errors = []
+    n = predicts.shape[0]
+    for s in range(data[:, 1:].shape[1]):
+      currpredict = predicts[:, s].reshape((n, -1))
+      currreference = data[:, s].reshape((n, -1))
+      errors.append(np.mean(np.linalg.norm(currpredict - currreference, axis=1) / np.linalg.norm(currreference, axis=1)))
+        
+    print(f"Average Relative L2 Error over all times: {np.mean(errors):.4f}")
+
+    if len(data.shape) == 3:
+      if topdown:
+        fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+         
+      else:
+        fig, ax = plt.subplots(figsize=(4, 3))
+
+    if topdown:
+      @widgets.interact(i=(0, n-1))
+      def plot_interact(i=0):
+        if len(data.shape) == 3:
+          axes[0].clear()
+          axes[1].clear()
+          axes[2].clear()
+
+          fig.suptitle(f"RelL2 {np.linalg.norm(predicts[i, s-1] - data[i, s]) / np.linalg.norm(data[i, s])}")
+
+          axes[0].set_title("Exact")
+          axes[0].imshow(data[i, 1:], cmap=cmap, origin="lower", aspect='auto')
+
+          axes[1].set_title("Predict")
+          axes[1].imshow(predicts[i, 1:], cmap=cmap, origin="lower", aspect='auto')
+
+          axes[2].set_title("|Exact - Predict|")
+          axes[2].imshow(np.abs(data[i, 1:] - predicts[i]), cmap=cmap, origin="lower", aspect='auto')
+       
+    else:
+      @widgets.interact(i=(0, n-1), s=(1, etinet.T-1))
+      def plot_interact(i=0, s=1):
+        print(f"Avg Relative L2 Error for t0 to t{s}: {errors[s-1]:.4f}")
+
+        if len(data.shape) == 3:
+          ax.clear()
+          ax.set_title(f"RelL2 {np.linalg.norm(predicts[i, s-1] - data[i, s]) / np.linalg.norm(data[i, s])}")
+          ax.plot(xs, data[i, 0], label="Input", linewidth=1)
+          ax.plot(xs, predicts[i, s-1], label="Predicted", linewidth=1)
+          ax.plot(xs, data[i, s], label="Exact", linewidth=1)
+          ax.legend()
+
+  @staticmethod
+  def plot_errorparams(etinet, param=-1):
+    if param == -1:
+        # Auto-detect one varying parameter
+        param = 0
+        P = etinet.dataset.params.shape[1]
+        for p in range(P):
+            if np.abs(etinet.dataset.params[0, p] - etinet.dataset.params[1, p]) > 0:
+                param = p
+                break
+
+    l2error = np.asarray(ETIHelper.get_operrs(etinet, times=[etinet.T - 1]))
+    params = etinet.dataset.params
+
+    print(params.shape, l2error.shape)
+
+    if isinstance(param, (list, tuple, np.ndarray)) and len(param) == 2:
+        # 3D scatter plot for 2 varying parameters
+        x = params[:, param[0]]
+        y = params[:, param[1]]
+        z = l2error
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        sc = ax.scatter(x, y, z, c=z, cmap='viridis', s=10)
+
+        ax.set_xlabel(f"Param {param[0]}")
+        ax.set_ylabel(f"Param {param[1]}")
+        ax.set_zlabel("Operator Error")
+        fig.colorbar(sc, ax=ax, label="Operator Error")
+
+    else:
+      # Fallback to 2D scatter if param is 1D
+      fig, ax = plt.subplots()
+      ax.scatter(params[:, param], l2error, s=2)
+      ax.set_xlabel(f"Parameter {param}")
+      ax.set_ylabel("Operator Error")
+
+    fig.tight_layout()
+
+class ETINet():
+  def __init__(self, dataset, k, aeclass, aeparams, recclass, recparams, td, seed, device):
+    self.dataset = dataset
+    self.device = device
+    self.td = td
+    self.k = k
+
+    self.timetaken = 0
+  
+    if self.td is None:
+      self.prefix = f"{self.dataset.name}{str(recclass.__name__)}ETINet"
+    else:
+      self.prefix = self.td
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    self.seed = seed
+
+    datacopy = self.dataset.data.copy()
+    self.numtrain = int(datacopy.shape[0] * 0.8)
+    
+    self.T = self.dataset.data.shape[1]
+    self.trainarr = datacopy[:self.numtrain]
+    self.testarr = datacopy[self.numtrain:]
+    self.optparams = None
+
+    self.datadim = len(self.dataset.data.shape) - 2
+    self.aestep = 0
+    self.recstep = 0
+
+    aeparams["encodeSeq"][0] = self.dataset.data.shape[-1]
+    aeparams["encodeSeq"][-1] = self.k
+    aeparams["decodeSeq"][0] = self.k
+    aeparams["decodeSeq"][-1] = self.dataset.data.shape[-1]
+
+    recparams["seq"][0] = self.k + 1
+    recparams["seq"][-1] = self.dataset.data.shape[-1]
+
+    self.aeclass = aeclass
+    self.aeparams = copy.deepcopy(aeparams)
+    self.recclass = recclass
+    self.recparams = copy.deepcopy(recparams)
+
+    self.aenet = aeclass(**aeparams).float().to(device)
+    self.recnet = recclass(**recparams).float().to(device)
+
+    self.metadata = {
+      "aeclass": aeclass.__name__,
+      "aeparams": aeparams,
+      "recclass": recclass.__name__,
+      "recparams": recparams,
+      "dataset_name": dataset.name,
+      "data_shape": list(dataset.data.shape),
+      "data_checksum": float(np.sum(dataset.data)),
+      "seed": seed,
+    }
+
+    self.epochs = []
+
+  def reconstruct(self, z, ts):
+    z_shape = z.shape
+    *leading_dims, N = z_shape
+    T = ts.shape[0]
+
+    z_expanded = z.unsqueeze(-2).expand(*leading_dims, T, N)
+
+    t_shape = [1] * len(leading_dims) + [T, 1]
+    t_expanded = ts.view(*t_shape).expand(*leading_dims, T, 1)
+
+    result = torch.cat([z_expanded, t_expanded], dim=-1)
+
+    recon = self.recnet(result)
+    return recon
+
+  def propagate(self, code, start=1, end=-1):
+    fullts = torch.linspace(0, 1, self.T).float().to(self.device)
+    
+    if end > 0:
+      ts = fullts[start:end+1]
+    else:
+      ts = fullts[start:]
+
+    out = self.reconstruct(code, ts)
+    return out
+
+  def get_errors(self, testarr, testrest, ords=(2,), times=None, aggregate=True):
+    assert(aggregate or len(ords) == 1)
+    
+    if isinstance(testarr, np.ndarray):
+      testarr = torch.tensor(testarr, dtype=torch.float32)
+
+    if isinstance(testrest, np.ndarray):
+      testrest = torch.tensor(testrest, dtype=torch.float32)
+
+    if times is None:
+      times = range(self.T-1)
+  
+    out = self.propagate(testarr)
+
+    n = testarr.shape[0]
+    orig = testrest.cpu().detach().numpy()
+    out = out.cpu().detach().numpy()
+
+    if aggregate:
+      orig = orig.reshape([n, -1])
+      out = out.reshape([n, -1])
+      testerrs = []
+      for o in ords:
+        testerrs.append(np.mean(np.linalg.norm(orig - out, axis=1, ord=o) / np.linalg.norm(orig, axis=1, ord=o)))
+
+      return tuple(testerrs)
+    
+    else:
+      o = ords[0]
+      testerrs = []
+
+      if len(times) == 1:
+        t = times[0]
+        origslice = orig[:, t-1].reshape([n, -1])
+        outslice = out[:, t-1].reshape([n, -1])
+        return np.linalg.norm(origslice - outslice, axis=1, ord=o) / np.linalg.norm(origslice, axis=1, ord=o)
+      else:
+        for t in range(orig.shape[1]):
+          origslice = orig[:, t].reshape([n, -1])
+          outslice = out[:, t].reshape([n, -1])
+          testerrs.append(np.mean(np.linalg.norm(origslice - outslice, axis=1, ord=o) / np.linalg.norm(origslice, axis=1, ord=o)))
+
+        return testerrs
+      
+  def get_ae_errors(self, testarr, ords=(2,)):
+    if isinstance(testarr, np.ndarray):
+      testarr = torch.tensor(testarr, dtype=torch.float32)
+  
+    out = self.aenet(testarr).cpu().detach().numpy()
+    orig = testarr.cpu().detach().numpy()
+
+    testerrs = []
+    for o in ords:
+      testerrs.append(np.mean(np.linalg.norm(orig - out, axis=1, ord=o) / np.linalg.norm(orig, axis=1, ord=o)))
+
+    return tuple(testerrs)
+
+  def load_models(self, filename_prefix, verbose=False, min_epochs=0):
+    search_path = f"savedmodels/etinet/{filename_prefix}*.pickle"
+    matching_files = glob.glob(search_path)
+
+    print("Searching for model files matching prefix:", filename_prefix)
+    if not hasattr(self, "metadata"):
+        raise ValueError("Missing self.metadata. Cannot match models without metadata. Ensure model has been initialized with same config.")
+
+    for addr in matching_files:
+      try:
+          with open(addr, "rb") as handle:
+              dic = pickle.load(handle)
+      except Exception as e:
+          if verbose:
+              print(f"Skipping {addr} due to read error: {e}")
+          continue
+
+      meta = dic.get("metadata", {})
+      is_match = all(
+          meta.get(k) == self.metadata.get(k)
+          for k in self.metadata.keys()
+      )
+
+      # Check if model meets the minimum epoch requirement
+      model_epochs = dic["epochs"]
+      if model_epochs is None:
+          if verbose:
+              print(f"Skipping {addr} due to missing epoch metadata.")
+          continue
+      elif isinstance(model_epochs, list):  # handle legacy or list format
+          if sum(model_epochs) < min_epochs:
+              if verbose:
+                  print(f"Skipping {addr} due to insufficient epochs ({sum(model_epochs)} < {min_epochs})")
+              continue
+      elif model_epochs < min_epochs:
+          if verbose:
+              print(f"Skipping {addr} due to insufficient epochs ({model_epochs} < {min_epochs})")
+          continue
+
+      if is_match:
+          print("Model match found. Loading from:", addr)
+          self.recnet.load_state_dict(dic["recnet"])
+          self.aenet.load_state_dict(dic["aenet"])
+          self.epochs = model_epochs
+          self.timetaken = dic["timetaken"]
+          if "opt" in dic:     
+            self.optparams = dic["opt"]
+
+          return True
+      elif verbose:
+          print("Metadata mismatch in file:", addr)
+          for k in self.metadata:
+              print(f"{k}: saved={meta.get(k)} vs current={self.metadata.get(k)}")
+
+    print("Load failed. No matching models found.")
+    print("Searched:", matching_files)
+    return False
+
+  def train_recnet(self, epochs, save=True, optim=torch.optim.AdamW, lr=1e-4, printinterval=10, batch=32, ridge=0, loss=None, best=True, verbose=False):
+    def recnet_epoch(dataloader, writer=None, optimizer=None, scheduler=None, ep=0, printinterval=10, loss=None, testarr=None, testrest=None):
+      losses = []
+      testerrors1 = []
+      testerrors2 = []
+      testerrorsinf = []
+
+      def closure(codes, rest):
+        optimizer.zero_grad()
+
+        out = self.propagate(codes)
+        target = rest
+        
+        res = loss(out, target)
+        res.backward()
+        
+        if writer is not None and self.recstep % 5 == 0:
+          writer.add_scalar("main/loss", res, global_step=self.recstep)
+
+        return res
+
+      for codes, rest in dataloader:
+        self.recstep += 1
+        error = optimizer.step(lambda: closure(codes, rest))
+        losses.append(float(error.cpu().detach()))
+
+      if scheduler is not None:
+        scheduler.step(np.mean(losses))
+
+      # print test
+      if printinterval > 0 and (ep % printinterval == 0):
+        testerr1, testerr2, testerrinf = self.get_errors(testarr, testrest, ords=(1, 2, np.inf))
+        if scheduler is not None:
+          print(f"{ep+1}: Train Loss {error:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative ETINet Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+        else:
+          print(f"{ep+1}: Train Loss {error:.3e}, Relative ETINet Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+
+        if writer is not None:
+            writer.add_scalar("misc/relativeL1error", testerr1, global_step=ep)
+            writer.add_scalar("main/relativeL2error", testerr2, global_step=ep)
+            writer.add_scalar("misc/relativeLInferror", testerrinf, global_step=ep)
+
+      return losses, testerrors1, testerrors2, testerrorsinf
+  
+    assert(self.aestep > 0)
+
+    loss = nn.MSELoss() if loss is None else loss()
+
+    losses, testerrors1, testerrors2, testerrorsinf = [], [], [], []
+
+    initial = torch.tensor(self.trainarr[:, 0], dtype=torch.float32).to(self.device)
+    rest = torch.tensor(self.trainarr[:, 1:], dtype=torch.float32).to(self.device)
+    train = self.aenet.encode(initial).detach()
+
+    testinitial = torch.tensor(self.testarr[:, 0], dtype=torch.float32).to(self.device)
+    testrest = torch.tensor(self.testarr[:, 1:], dtype=torch.float32).to(self.device)
+    test = self.aenet.encode(testinitial).detach()
+
+    opt = optim(self.recnet.parameters(), lr=lr, weight_decay=ridge)
+    scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
+    dataloader = DataLoader(torch.utils.data.TensorDataset(train, rest), shuffle=False, batch_size=batch)
+
+    writer = None
+    if self.td is not None:
+      name = f"./tensorboard/{datetime.datetime.now().strftime('%d-%B-%Y')}/{self.td}/{datetime.datetime.now().strftime('%H.%M.%S')}/"
+      writer = torch.utils.tensorboard.SummaryWriter(name)
+      print("Tensorboard writer location is " + name)
+
+    print("Number of NN trainable parameters", utils.num_params(self.recnet))
+    print(f"Starting ETINet rec model at {time.asctime()}...")
+    print("train", train.shape, "test", test.shape)
+    start = time.time()
+
+    bestdict = { "loss": float(np.inf), "ep": 0 }
+    for ep in range(epochs):
+      lossesN, testerrors1N, testerrors2N, testerrorsinfN = recnet_epoch(dataloader, optimizer=opt, scheduler=scheduler, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test, testrest=testrest)
+      losses += lossesN; testerrors1 += testerrors1N; testerrors2 += testerrors2N; testerrorsinf += testerrorsinfN
+
+      if best and ep > epochs // 2:
+        avgloss = np.mean(lossesN)
+        if avgloss < bestdict["loss"]:
+          bestdict["recnet"] = self.recnet.state_dict()
+          bestdict["opt"] = opt.state_dict()
+          bestdict["loss"] = avgloss
+          bestdict["ep"] = ep
+        elif verbose:
+          print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
+      
+    print(f"Finished training ETINet rec model at {time.asctime()}...")
+    end = time.time()
+    self.timetaken += end - start
+
+    if best:
+      self.recnet.load_state_dict(bestdict["recnet"])
+      opt.load_state_dict(bestdict["opt"])
+
+    self.aeoptparams = opt.state_dict()
+    self.epochs.append(epochs)
+
+    if save:
+      now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+      # Compute total training epochs
+      total_epochs = sum(self.epochs) if isinstance(self.epochs, list) else self.epochs
+
+      filename = (
+          f"{self.dataset.name}_"
+          f"{self.aeclass.__name__}_"
+          f"{self.aeparams['encodeSeq']}_"
+          f"{self.recclass.__name__}_"
+          f"{self.recparams['seq']}_"
+          f"{self.seed}_"
+          f"{total_epochs}ep_"
+          f"{now}.pickle"
+      )
+
+      dire = "savedmodels/etinet"
+      addr = os.path.join(dire, filename)
+
+      if not os.path.exists(dire):
+          os.makedirs(dire)
+
+      with open(addr, "wb") as handle:
+          pickle.dump({
+              "aenet": self.aenet.state_dict(),
+              "recnet": self.recnet.state_dict(),
+              "metadata": self.metadata,
+              "opt": self.optparams,
+              "epochs": self.epochs,
+              "timetaken": self.timetaken
+          }, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+      print("Model saved at", addr)
+
+    return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf }
+
+  def train_aenet(self, epochs, optim=torch.optim.AdamW, lr=1e-4, printinterval=10, batch=32, ridge=0, loss=None, best=True, verbose=False):
+    def aenet_epoch(dataloader, writer=None, optimizer=None, scheduler=None, ep=0, printinterval=10, loss=None, testarr=None):
+      losses = []
+      testerrors1 = []
+      testerrors2 = []
+      testerrorsinf = []
+
+      def closure(codes):
+        optimizer.zero_grad()
+
+        out = self.aenet(codes)
+        target = codes
+        
+        res = loss(out, target)
+        res.backward()
+        
+        if writer is not None and self.aestep % 5 == 0:
+          writer.add_scalar("main/aeloss", res, global_step=self.aestep)
+
+        return res
+
+      for codes in dataloader:
+        self.aestep += 1
+        error = optimizer.step(lambda: closure(codes))
+        losses.append(float(error.cpu().detach()))
+
+      if scheduler is not None:
+        scheduler.step(np.mean(losses))
+
+      # print test
+      if printinterval > 0 and (ep % printinterval == 0):
+        testerr1, testerr2, testerrinf = self.get_ae_errors(testarr, ords=(1, 2, np.inf))
+        if scheduler is not None:
+          print(f"{ep+1}: Train Loss {error:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative ETINet AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+        else:
+          print(f"{ep+1}: Train Loss {error:.3e}, Relative ETINet AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+
+        if writer is not None:
+            writer.add_scalar("misc/relativeL1error", testerr1, global_step=ep)
+            writer.add_scalar("main/relativeL2error", testerr2, global_step=ep)
+            writer.add_scalar("misc/relativeLInferror", testerrinf, global_step=ep)
+
+      return losses, testerrors1, testerrors2, testerrorsinf
+  
+    loss = nn.MSELoss() if loss is None else loss()
+
+    losses, testerrors1, testerrors2, testerrorsinf = [], [], [], []
+
+    initial = torch.tensor(self.trainarr[:, 0], dtype=torch.float32).to(self.device)
+    test = torch.tensor(self.testarr[:, 0], dtype=torch.float32).to(self.device)
+
+    opt = optim(self.aenet.parameters(), lr=lr, weight_decay=ridge)
+    scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=50, factor=0.9)
+    dataloader = DataLoader(initial, shuffle=False, batch_size=batch)
+
+    if self.optparams is not None:
+      opt.load_state_dict(self.optparams)
+
+    writer = None
+    if self.td is not None:
+      name = f"./tensorboard/{datetime.datetime.now().strftime('%d-%B-%Y')}/{self.td}/{datetime.datetime.now().strftime('%H.%M.%S')}/"
+      writer = torch.utils.tensorboard.SummaryWriter(name)
+      print("Tensorboard writer location is " + name)
+
+    print("Number of NN trainable parameters", utils.num_params(self.aenet))
+    print(f"Starting training ETINet AE model at {time.asctime()}...")
+    print("train", initial.shape, "test", test.shape)
+    start = time.time()
+
+    bestdict = { "loss": float(np.inf), "ep": 0 }
+    for ep in range(epochs):
+      lossesN, testerrors1N, testerrors2N, testerrorsinfN = aenet_epoch(dataloader, optimizer=opt, scheduler=scheduler, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test)
+      losses += lossesN; testerrors1 += testerrors1N; testerrors2 += testerrors2N; testerrorsinf += testerrorsinfN
+
+      if best and ep > epochs // 2:
+        avgloss = np.mean(lossesN)
+        if avgloss < bestdict["loss"]:
+          bestdict["aenet"] = self.aenet.state_dict()
+          bestdict["opt"] = opt.state_dict()
+          bestdict["loss"] = avgloss
+          bestdict["ep"] = ep
+        elif verbose:
+          print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
+      
+    print(f"Finished training ETINet AE model at {time.asctime()}...")
+    end = time.time()
+    self.timetaken += end - start
+
+    if best:
+      self.aenet.load_state_dict(bestdict["aenet"])
+      opt.load_state_dict(bestdict["opt"])
+
+    return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf }
+
+class ELDHelper():
+  def __init__(self, config):
+    self.update_config(config)
+
+  def update_config(self, config):
+    self.config = deepcopy(config)
+
+  def create_eldnet(self, dataset, f, k, config=None, **args):
+    if config is None:
+      config = self.config
+
+    assert(len(dataset.data.shape) < 4)
+    if len(dataset.data.shape) == 3:
+      dout = dataset.data.shape[-1]
+
+    td = args.get("td", None)
+    seed = args.get("seed", 0)
+    device = args.get("device", 0)
+
+    aeclass = globals()[args.get("aeclass", config.aeclass)]
+    aeparams = copy.deepcopy(dict(args.get("aeparams", config.aeparams)))
+    dynclass = globals()[args.get("dynclass", config.dynclass)]
+    dynparams = copy.deepcopy(dict(args.get("dynparams", config.dynparams)))
+    decclass = globals()[args.get("decclass", config.decclass)]
+    recparams = copy.deepcopy(dict(args.get("recparams", config.recparams)))
+
+    dynparams["seq"][0] = k + f
+    dynparams["seq"][-1] = k
+    recparams["seq"][0] = k + f
+    recparams["seq"][-1] = dout
+
+    return ELDNet(dataset, f, k, aeclass, aeparams, dynclass, dynparams, decclass, recparams, td=td, seed=seed, device=device)
+
+  @staticmethod
+  def get_operrs(ldnet, times=None, testonly=False):
+    if testonly:
+      data = ldnet.dataset.data[ldnet.numtrain:,]
+    else:
+      data = ldnet.dataset.data
+
+    inputs = torch.tensor(data).to(ldnet.device)
+    dataparams = ldnet.aenet.encode(inputs[:, 0]).detach()
+    errors = ldnet.get_errors(data, dataparams, times=times, aggregate=False)
+
+    return errors
+  
+  @staticmethod
+  def plot_op_predicts(ldnet, testonly=False, xs=None, cmap="viridis"):
+    if testonly:
+      data = ldnet.dataset.data[ldnet.numtrain:,]
+    else:
+      data = ldnet.dataset.data
+
+    if xs == None:
+      xs = np.linspace(0, 1, len(data[0, 0]))
+
+    pinput = torch.tensor(np.float32(data[:, 0])).to(ldnet.device)
+    params = ldnet.aenet.encode(pinput).detach()
+
+    predicts = ldnet.propagate(params).cpu().detach()
+
+    errors = []
+    n = predicts.shape[0]
+    for s in range(data.shape[1]):
+      currpredict = predicts[:, s-1].reshape((n, -1))
+      currreference = data[:, s].reshape((n, -1))
+      errors.append(np.mean(np.linalg.norm(currpredict - currreference, axis=1) / np.linalg.norm(currreference, axis=1)))
+        
+    print(f"Average Relative L2 Error over all times: {np.mean(errors):.4f}")
+
+    if len(data.shape) == 3:
+      fig, ax = plt.subplots(figsize=(4, 3))
+
+    @widgets.interact(i=(0, n-1), s=(1, ldnet.T-1))
+    def plot_interact(i=0, s=1):
+      print(f"Avg Relative L2 Error for t0 to t{s}: {errors[s-1]:.4f}")
+
+      if len(data.shape) == 3:
+        ax.clear()
+        ax.set_title(f"RelL2 {np.linalg.norm(predicts[i, s-1] - data[i, s]) / np.linalg.norm(data[i, s])}")
+        ax.plot(xs, data[i, 0], label="Input", linewidth=1)
+        ax.plot(xs, predicts[i, s-1], label="Predicted", linewidth=1)
+        ax.plot(xs, data[i, s], label="Exact", linewidth=1)
+        ax.legend()
+        
+  @staticmethod
+  def plot_errorparams(ldnet, param=-1):
+    if param == -1:
+        # Auto-detect one varying parameter
+        param = 0
+        P = ldnet.dataset.params.shape[1]
+        for p in range(P):
+            if np.abs(ldnet.dataset.params[0, p] - ldnet.dataset.params[1, p]) > 0:
+                param = p
+                break
+
+    l2error = np.asarray(LDHelper.get_operrs(ldnet, times=[ldnet.T - 1]))
+    params = ldnet.dataset.params
+
+    print(params.shape, l2error.shape)
+
+    if isinstance(param, (list, tuple, np.ndarray)) and len(param) == 2:
+        # 3D scatter plot for 2 varying parameters
+        x = params[:, param[0]]
+        y = params[:, param[1]]
+        z = l2error
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        sc = ax.scatter(x, y, z, c=z, cmap='viridis', s=10)
+
+        ax.set_xlabel(f"Param {param[0]}")
+        ax.set_ylabel(f"Param {param[1]}")
+        ax.set_zlabel("Operator Error")
+        fig.colorbar(sc, ax=ax, label="Operator Error")
+
+    else:
+        # Fallback to 2D scatter if param is 1D
+        fig, ax = plt.subplots()
+        ax.scatter(params[:, param], l2error, s=2)
+        ax.set_xlabel(f"Parameter {param}")
+        ax.set_ylabel("Operator Error")
+
+    fig.tight_layout()
+
+class ELDNet():
+  def __init__(self, dataset, f, k, aeclass, aeparams, dynclass, dynparams, decclass, recparams, td, seed, device):
+    self.dataset = dataset
+    self.device = device
+    self.td = td
+    self.k = k
+    self.f = f
+
+    self.timetaken = 0
+  
+    if self.td is None:
+      self.prefix = f"{self.dataset.name}{str(dynclass.__name__)}ELDNet-{self.k+self.f}"
+    else:
+      self.prefix = self.td
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    self.seed = seed
+
+    datacopy = self.dataset.data.copy()
+    self.numtrain = int(datacopy.shape[0] * 0.8)
+    
+    self.T = self.dataset.data.shape[1]
+    self.trainarr = datacopy[:self.numtrain]
+    self.testarr = datacopy[self.numtrain:]
+    self.optparams = None
+
+    self.datadim = len(self.dataset.data.shape) - 2
+
+    self.aeclass = aeclass
+    self.aeparams = copy.deepcopy(aeparams)
+    self.dynclass = dynclass
+    self.dynparams = copy.deepcopy(dynparams)
+    self.decclass = decclass
+    self.recparams = copy.deepcopy(recparams)
+
+    aeparams["encodeSeq"][0] = self.dataset.data.shape[-1]
+    aeparams["encodeSeq"][-1] = self.f
+    aeparams["decodeSeq"][0] = self.f
+    aeparams["decodeSeq"][-1] = self.dataset.data.shape[-1]
+
+    dynparams["seq"][0] = self.k + self.f
+    dynparams["seq"][-1] = self.k
+    recparams["seq"][0] = self.k + self.f
+    recparams["seq"][-1] = self.dataset.data.shape[-1]
+
+    self.aenet = aeclass(**aeparams).float().to(device)
+    self.dynnet = dynclass(**dynparams).float().to(device)
+    self.recnet = decclass(**recparams).float().to(device)
+
+    self.metadata = {
+      "aeclass": aeclass.__name__,
+      "aeparams": aeparams,
+      "dynclass": dynclass.__name__,
+      "dynparams": dynparams,
+      "decclass": decclass.__name__,
+      "recparams": recparams,
+      "dataset_name": dataset.name,
+      "data_shape": list(dataset.data.shape),
+      "data_checksum": float(np.sum(dataset.data)),
+      "seed": seed,
+    }
+
+    self.epochs = []
+
+  def propagate(self, code, start=0, end=-1, returncodes=False):
+    if end == -1:
+      end = self.T - 1
+
+    z = code
+
+    # get first decode
+    if z.shape[-1] != self.f + self.k:
+      if z.shape[-1] == self.f:
+        z_fixed = z
+        z_dynamic = torch.zeros(list(z_fixed.shape[:-1]) + [self.k])
+        z = torch.cat([z_fixed, z_dynamic], dim=-1)
+      else:
+        print(z.shape)
+        assert(False)
+
+    zpreds = [z]
+    for t in range(start, end):
+      z = self.forward(z)
+      zpreds.append(z)
+
+    zpreds = torch.stack(zpreds, dim=1)
+    upreds = self.recnet(zpreds)
+
+    if returncodes:
+      return upreds, zpreds
+    else:
+      return upreds
+     
+  def get_ae_errors(self, testarr, ords=(2,)):
+    if isinstance(testarr, np.ndarray):
+      testarr = torch.tensor(testarr, dtype=torch.float32)
+  
+    out = self.aenet(testarr).cpu().detach().numpy()
+    orig = testarr.cpu().detach().numpy()
+
+    testerrs = []
+    for o in ords:
+      testerrs.append(np.mean(np.linalg.norm(orig - out, axis=1, ord=o) / np.linalg.norm(orig, axis=1, ord=o)))
+
+    return tuple(testerrs)
+
+  def get_errors(self, testarr, testparams, ords=(2,), times=None, aggregate=True):
+    assert(aggregate or len(ords) == 1)
+    
+    if isinstance(testarr, np.ndarray):
+      testarr = torch.tensor(testarr, dtype=torch.float32)
+
+    if isinstance(testparams, np.ndarray):
+      testparams = torch.tensor(testparams, dtype=torch.float32)
+
+    if times is None:
+      times = range(self.T-1)
+  
+    out = self.propagate(testparams)
+
+    n = testarr.shape[0]
+    orig = testarr.cpu().detach().numpy()
+    out = out.cpu().detach().numpy()
+
+    if aggregate:
+      orig = orig.reshape([n, -1])
+      out = out.reshape([n, -1])
+      testerrs = []
+      for o in ords:
+        testerrs.append(np.mean(np.linalg.norm(orig - out, axis=1, ord=o) / np.linalg.norm(orig, axis=1, ord=o)))
+
+      return tuple(testerrs)
+    
+    else:
+      o = ords[0]
+      testerrs = []
+
+      if len(times) == 1:
+        t = times[0]
+        origslice = orig[:, t].reshape([n, -1])
+        outslice = out[:, t].reshape([n, -1])
+        return np.linalg.norm(origslice - outslice, axis=1, ord=o) / np.linalg.norm(origslice, axis=1, ord=o)
+      else:
+        for t in range(orig.shape[1]):
+          origslice = orig[:, t].reshape([n, -1])
+          outslice = out[:, t].reshape([n, -1])
+          testerrs.append(np.mean(np.linalg.norm(origslice - outslice, axis=1, ord=o) / np.linalg.norm(origslice, axis=1, ord=o)))
+
+        return testerrs
+
+  def forward(self, z_full, decode=False):
+    if z_full.shape[-1] == self.f + self.k:
+      z_fixed = z_full[..., :self.f]
+      z_dynamic = z_full[..., self.f:]
+
+    else:
+      if z_full.shape[-1] == self.f:
+        z_fixed = z_full
+        z_dynamic = torch.zeros(list(z_fixed.shape[:-1]) + [self.k])
+        z_full = torch.cat([z_fixed, z_dynamic], dim=-1)
+      else:
+        print(z_full.shape)
+        assert(False)
+
+    deltaz = self.dynnet(z_full)
+    z_next_dynamic = z_dynamic + deltaz
+    z_next_full = torch.cat([z_fixed, z_next_dynamic], dim=-1)
+
+    if decode:
+      decoded = self.recnet(z_next_full)
+      return decoded, z_next_full
+    
+    else:
+      return z_next_full
+
+  def load_models(self, filename_prefix, verbose=False, min_epochs=0):
+    search_path = f"savedmodels/eldnet/{filename_prefix}*.pickle"
+    matching_files = glob.glob(search_path)
+
+    print("Searching for model files matching prefix:", filename_prefix)
+    if not hasattr(self, "metadata"):
+        raise ValueError("Missing self.metadata. Cannot match models without metadata. Ensure model has been initialized with same config.")
+
+    for addr in matching_files:
+      try:
+          with open(addr, "rb") as handle:
+              dic = pickle.load(handle)
+      except Exception as e:
+          if verbose:
+              print(f"Skipping {addr} due to read error: {e}")
+          continue
+
+      meta = dic.get("metadata", {})
+      is_match = all(
+          meta.get(k) == self.metadata.get(k)
+          for k in self.metadata.keys()
+      )
+
+      # Check if model meets the minimum epoch requirement
+      model_epochs = dic["epochs"]
+      if model_epochs is None:
+          if verbose:
+              print(f"Skipping {addr} due to missing epoch metadata.")
+          continue
+      elif isinstance(model_epochs, list):  # handle legacy or list format
+          if sum(model_epochs) < min_epochs:
+              if verbose:
+                  print(f"Skipping {addr} due to insufficient epochs ({sum(model_epochs)} < {min_epochs})")
+              continue
+      elif model_epochs < min_epochs:
+          if verbose:
+              print(f"Skipping {addr} due to insufficient epochs ({model_epochs} < {min_epochs})")
+          continue
+
+      if is_match:
+          print("Model match found. Loading from:", addr)
+          self.aenet.load_state_dict(dic["aenet"])
+          self.dynnet.load_state_dict(dic["dynnet"])
+          self.recnet.load_state_dict(dic["recnet"])
+          self.epochs = model_epochs
+          self.timetaken = dic["timetaken"]
+          if "opt" in dic:     
+            self.optparams = dic["opt"]
+
+          return True
+      elif verbose:
+          print("Metadata mismatch in file:", addr)
+          for k in self.metadata:
+              print(f"{k}: saved={meta.get(k)} vs current={self.metadata.get(k)}")
+
+    print("Load failed. No matching models found.")
+    print("Searched:", matching_files)
+    return False
+
+  def train_aenet(self, epochs, optim=torch.optim.AdamW, lr=1e-4, printinterval=10, batch=32, ridge=0, loss=None, best=True, verbose=False):
+    def aenet_epoch(dataloader, writer=None, optimizer=None, scheduler=None, ep=0, printinterval=10, loss=None, testarr=None):
+      losses = []
+      testerrors1 = []
+      testerrors2 = []
+      testerrorsinf = []
+
+      def closure(codes):
+        optimizer.zero_grad()
+
+        out = self.aenet(codes)
+        target = codes
+        
+        res = loss(out, target)
+        res.backward()
+        
+        if writer is not None and self.aestep % 5 == 0:
+          writer.add_scalar("main/aeloss", res, global_step=self.aestep)
+
+        return res
+
+      for codes in dataloader:
+        self.aestep += 1
+        error = optimizer.step(lambda: closure(codes))
+        losses.append(float(error.cpu().detach()))
+
+      if scheduler is not None:
+        scheduler.step(np.mean(losses))
+
+      # print test
+      if printinterval > 0 and (ep % printinterval == 0):
+        testerr1, testerr2, testerrinf = self.get_ae_errors(testarr, ords=(1, 2, np.inf))
+        if scheduler is not None:
+          print(f"{ep+1}: Train Loss {error:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative ELDNet AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+        else:
+          print(f"{ep+1}: Train Loss {error:.3e}, Relative ELDNet AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+
+        if writer is not None:
+            writer.add_scalar("misc/relativeL1error", testerr1, global_step=ep)
+            writer.add_scalar("main/relativeL2error", testerr2, global_step=ep)
+            writer.add_scalar("misc/relativeLInferror", testerrinf, global_step=ep)
+
+      return losses, testerrors1, testerrors2, testerrorsinf
+  
+    self.aestep = 0
+    loss = nn.MSELoss() if loss is None else loss()
+
+    losses, testerrors1, testerrors2, testerrorsinf = [], [], [], []
+
+    initial = torch.tensor(self.trainarr[:, 0], dtype=torch.float32).to(self.device)
+    test = torch.tensor(self.testarr[:, 0], dtype=torch.float32).to(self.device)
+
+    opt = optim(self.aenet.parameters(), lr=lr, weight_decay=ridge)
+    scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=50, factor=0.9)
+    dataloader = DataLoader(initial, shuffle=False, batch_size=batch)
+
+    if self.optparams is not None:
+      opt.load_state_dict(self.optparams)
+
+    writer = None
+    if self.td is not None:
+      name = f"./tensorboard/{datetime.datetime.now().strftime('%d-%B-%Y')}/{self.td}/{datetime.datetime.now().strftime('%H.%M.%S')}/"
+      writer = torch.utils.tensorboard.SummaryWriter(name)
+      print("Tensorboard writer location is " + name)
+
+    print("Number of NN trainable parameters", utils.num_params(self.aenet))
+    print(f"Starting training ELDNet AE model at {time.asctime()}...")
+    print("train", initial.shape, "test", test.shape)
+    start = time.time()
+
+    bestdict = { "loss": float(np.inf), "ep": 0 }
+    for ep in range(epochs):
+      lossesN, testerrors1N, testerrors2N, testerrorsinfN = aenet_epoch(dataloader, optimizer=opt, scheduler=scheduler, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test)
+      losses += lossesN; testerrors1 += testerrors1N; testerrors2 += testerrors2N; testerrorsinf += testerrorsinfN
+
+      if best and ep > epochs // 2:
+        avgloss = np.mean(lossesN)
+        if avgloss < bestdict["loss"]:
+          bestdict["aenet"] = self.aenet.state_dict()
+          bestdict["opt"] = opt.state_dict()
+          bestdict["loss"] = avgloss
+          bestdict["ep"] = ep
+        elif verbose:
+          print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
+      
+    print(f"Finished training ELDNet AE model at {time.asctime()}...")
+    end = time.time()
+    self.timetaken += end - start
+
+    if best:
+      self.aenet.load_state_dict(bestdict["aenet"])
+      opt.load_state_dict(bestdict["opt"])
+
+    return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf }
+
+  def train_ldnet(self, epochs, save=True, optim=torch.optim.AdamW, lr=1e-4, printinterval=10, batch=32, ridge=0, loss=None, best=True, verbose=False):
+    def train_epoch(dataloader, writer=None, optimizer=None, scheduler=None, ep=0, printinterval=10, loss=None, testarr=None, testparams=None):
+      losses = []
+      testerrors1 = []
+      testerrors2 = []
+      testerrorsinf = []
+
+      def closure(values, params):
+        optimizer.zero_grad()
+
+        out = self.propagate(params)
+        target = values
+        
+        res = loss(out, target)
+        res.backward()
+        
+        if writer is not None and self.trainstep % 5 == 0:
+          writer.add_scalar("main/loss", res, global_step=self.trainstep)
+
+        return res
+
+      for values, params in dataloader:
+        self.trainstep += 1
+        error = optimizer.step(lambda: closure(values, params))
+        losses.append(float(error.cpu().detach()))
+
+      if scheduler is not None:
+        scheduler.step(np.mean(losses))
+
+      # print test
+      if printinterval > 0 and (ep % printinterval == 0):
+        testerr1, testerr2, testerrinf = self.get_errors(testarr, testparams, ords=(1, 2, np.inf))
+        if scheduler is not None:
+          print(f"{ep+1}: Train Loss {error:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative ELDNet Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+        else:
+          print(f"{ep+1}: Train Loss {error:.3e}, Relative ELDNet Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+
+        if writer is not None:
+            writer.add_scalar("misc/relativeL1error", testerr1, global_step=ep)
+            writer.add_scalar("main/relativeL2error", testerr2, global_step=ep)
+            writer.add_scalar("misc/relativeLInferror", testerrinf, global_step=ep)
+
+      return losses, testerrors1, testerrors2, testerrorsinf
+  
+    loss = nn.MSELoss() if loss is None else loss()
+
+    losses, testerrors1, testerrors2, testerrorsinf = [], [], [], []
+    self.trainstep = 0
+
+    train = torch.tensor(self.trainarr, dtype=torch.float32).to(self.device)
+    params = self.aenet.encode(train[:, 0]).detach()
+
+    test = torch.tensor(self.testarr, dtype=torch.float32).to(self.device)
+    testparams = self.aenet.encode(test[:, 0]).detach()
+
+    opt = optim(itertools.chain(self.dynnet.parameters(), self.recnet.parameters()), lr=lr, weight_decay=ridge)
+    scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
+    dataloader = DataLoader(torch.utils.data.TensorDataset(train, params), shuffle=False, batch_size=batch)
+
+    if self.optparams is not None:
+      opt.load_state_dict(self.optparams)
+
+    writer = None
+    if self.td is not None:
+      name = f"./tensorboard/{datetime.datetime.now().strftime('%d-%B-%Y')}/{self.td}/{datetime.datetime.now().strftime('%H.%M.%S')}/"
+      writer = torch.utils.tensorboard.SummaryWriter(name)
+      print("Tensorboard writer location is " + name)
+
+    print("Number of NN trainable parameters", utils.num_params(self.dynnet), "+", utils.num_params(self.recnet))
+    print(f"Starting training ELDNet model at {time.asctime()}...")
+    print("train", train.shape, "test", test.shape)
+    start = time.time()
+
+    bestdict = { "loss": float(np.inf), "ep": 0 }
+    for ep in range(epochs):
+      lossesN, testerrors1N, testerrors2N, testerrorsinfN = train_epoch(dataloader, optimizer=opt, scheduler=scheduler, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test, testparams=testparams)
+      losses += lossesN; testerrors1 += testerrors1N; testerrors2 += testerrors2N; testerrorsinf += testerrorsinfN
+
+      if best and ep > epochs // 2:
+        avgloss = np.mean(lossesN)
+        if avgloss < bestdict["loss"]:
+          bestdict["dynnet"] = self.dynnet.state_dict()
+          bestdict["recnet"] = self.recnet.state_dict()
+          bestdict["opt"] = opt.state_dict()
+          bestdict["loss"] = avgloss
+          bestdict["ep"] = ep
+        elif verbose:
+          print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
+      
+    print(f"Finished training ELDNet model at {time.asctime()}...")
+    end = time.time()
+    self.timetaken += end - start
+
+    if best:
+      self.dynnet.load_state_dict(bestdict["dynnet"])
+      self.recnet.load_state_dict(bestdict["recnet"])
+      opt.load_state_dict(bestdict["opt"])
+
+    self.optparams = opt.state_dict()
+    self.epochs.append(epochs)
+
+    if save:
+      now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+      # Compute total training epochs
+      total_epochs = sum(self.epochs) if isinstance(self.epochs, list) else self.epochs
+
+      filename = (
+          f"{self.dataset.name}_"
+          f"{self.dynclass.__name__}_"
+          f"{self.dynparams['seq']}_"
+          f"{self.decclass.__name__}_"
+          f"{self.recparams['seq']}_"
+          f"{self.seed}_"
+          f"{total_epochs}ep_"
+          f"{now}.pickle"
+      )
+
+      dire = "savedmodels/eldnet"
+      addr = os.path.join(dire, filename)
+
+      if not os.path.exists(dire):
+          os.makedirs(dire)
+
+      with open(addr, "wb") as handle:
+          pickle.dump({
+              "aenet": self.aenet.state_dict(),
+              "dynnet": self.dynnet.state_dict(),
+              "recnet": self.recnet.state_dict(),
+              "metadata": self.metadata,
+              "opt": self.optparams,
+              "epochs": self.epochs,
+              "timetaken": self.timetaken
+          }, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+      print("Model saved at", addr)
+
+    return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf }
 
 # abstract class
 class EncoderNet(nn.Module):

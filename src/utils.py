@@ -478,7 +478,7 @@ class DynamicData(torch.utils.data.Dataset):
             # plot
             if topdown:
                 assert len(self.data.shape) == 3, "topdown only supported for 3D time-series data"
-                img = ax.imshow(noisedarray[j], aspect='auto', vmin=cmin, vmax=cmax, cmap='jet')
+                img = ax.imshow(noisedarray[j], aspect='auto', vmin=cmin, vmax=cmax, cmap='jet', origin="lower")
                 ax.set_title(f"Data point {j} over all time vs. features")
             else:
                 if len(self.data.shape) == 3:
@@ -486,9 +486,9 @@ class DynamicData(torch.utils.data.Dataset):
                     ax.plot(noisedarray[j, t1, :], 'b', label=f"t={t1}")
                     ax.legend()
                 else:
-                    axes[0].imshow(noisedarray[j, t0], vmin=cmin, vmax=cmax, cmap="jet")
+                    axes[0].imshow(noisedarray[j, t0], vmin=cmin, vmax=cmax, cmap="jet", origin="lower")
                     axes[0].set_title(f"t={t0}")
-                    img2 = axes[1].imshow(noisedarray[j, t1], vmin=cmin, vmax=cmax, cmap="jet")
+                    img2 = axes[1].imshow(noisedarray[j, t1], vmin=cmin, vmax=cmax, cmap="jet", origin="lower")
                     axes[1].set_title(f"t={t1}")
 
             title = f"Params: {self.params[j]}" if hasattr(self, 'params') and self.params is not None else f"Data point {j}"
@@ -520,8 +520,8 @@ class DynamicData(torch.utils.data.Dataset):
 
             # plot
             if topdown:
-                assert len(self.data.shape) == 3, "topdown only supported for 3D time-series data"
-                img = ax.imshow(noisedarray[j], aspect='auto', vmin=cmin, vmax=cmax, cmap='jet')
+                assert len(self.data.shape) == 3, "topdown only supported for 2D time-series data"
+                img = ax.imshow(noisedarray[j], aspect='auto', vmin=cmin, vmax=cmax, cmap='jet', origin="lower")
                 ax.set_title(f"Data point {j} over all time vs. features")
             else:
                 if len(self.data.shape) == 3:
@@ -529,9 +529,9 @@ class DynamicData(torch.utils.data.Dataset):
                     ax.plot(noisedarray[j, t1, :], 'b', label=f"t={t1}")
                     ax.legend()
                 else:
-                    axes[0].imshow(noisedarray[j, t0], vmin=cmin, vmax=cmax, cmap="jet")
+                    axes[0].imshow(noisedarray[j, t0], vmin=cmin, vmax=cmax, cmap="jet", origin="lower")
                     axes[0].set_title(f"t={t0}")
-                    img2 = axes[1].imshow(noisedarray[j, t1], vmin=cmin, vmax=cmax, cmap="jet")
+                    img2 = axes[1].imshow(noisedarray[j, t1], vmin=cmin, vmax=cmax, cmap="jet", origin="lower")
                     axes[1].set_title(f"t={t1}")
 
             title = f"Params: {self.params[j]}" if self.params is not None else f"Data point {j}"
