@@ -104,9 +104,9 @@ class ConvEncoder(coder):
                     actvn
                 ) for i, ksp in enumerate(kernel_stride_paddings)],
                 nn.Flatten(),
-                nn.Linear(out_channels[-1]*prod(self.conv_layers_config[-1]["out_dims"]), 512),
+                nn.Linear(out_channels[-1]*prod(self.conv_layers_config[-1]["out_dims"]), 256),
                 actvn,
-                nn.Linear(512, latents_dims)
+                nn.Linear(256, latents_dims)
             )
         else:
             self.blocks = nn.Sequential(
@@ -144,9 +144,9 @@ class ConvDecoder(coder):
 
         if mlp:
             self.blocks = nn.Sequential(
-                nn.Linear(latents_dims, 512),
+                nn.Linear(latents_dims, 256),
                 actvn,
-                nn.Linear(512, in_channels[0]*prod(self.tconv_layers_config[0]["in_dims"])),
+                nn.Linear(256, in_channels[0]*prod(self.tconv_layers_config[0]["in_dims"])),
                 nn.Unflatten(1, (in_channels[0], *self.tconv_layers_config[0]["in_dims"])),
                 *[nn.Sequential(
                     actvn,
@@ -203,9 +203,9 @@ class ResnetEncoder(ConvEncoder):
                 ResBlock(out_channels[i+1], out_channels[i+1], self.dim, groups=gn_groups)
             ) for i, ksp in enumerate(kernel_stride_paddings)],
             nn.Flatten(),
-            nn.Linear(out_channels[-1]*prod(self.conv_layers_config[-1]["out_dims"]), 512),
+            nn.Linear(out_channels[-1]*prod(self.conv_layers_config[-1]["out_dims"]), 256),
             actvn,
-            nn.Linear(512, latents_dims)
+            nn.Linear(256, latents_dims)
         )
 
 class ResnetDecoder(ConvDecoder):
@@ -218,9 +218,9 @@ class ResnetDecoder(ConvDecoder):
         in_channels.append(out_channel)
 
         self.blocks = nn.Sequential(
-            nn.Linear(latents_dims, 512),
+            nn.Linear(latents_dims, 256),
             actvn,
-            nn.Linear(512, in_channels[0]*prod(self.tconv_layers_config[0]["in_dims"])),
+            nn.Linear(256, in_channels[0]*prod(self.tconv_layers_config[0]["in_dims"])),
             nn.Unflatten(1, (in_channels[0], *self.tconv_layers_config[0]["in_dims"])),
             *[nn.Sequential(
                 actvn,

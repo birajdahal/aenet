@@ -10,15 +10,14 @@ aeparams:
     spatial_resolution: 512
     latents_dims: 4
   downblocks:
-      channels: [16, 16, 16, 16]
+      channels: [16, 16, 16]
       kernel_stride_paddings: 
-      - [8, 2, 1]
-      - [8, 2, 1]
-      - [8, 2, 1]
-      - [8, 2, 1]
+      - [16, 2, 1]
+      - [16, 2, 1]
+      - [16, 2, 1]
       actvn: relu
     
 seqclass: FFNet
 seqparams:
-  seq: [4, 200, 200, 200, 4]
+  seq: [4, 300, 300, 300, 4]
   activation: relu

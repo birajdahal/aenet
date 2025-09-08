@@ -7,7 +7,7 @@ windows: 10
 aeclass: TCAutoencoder
 aeparams:
   encodeSeq: [1, 500, 500, 500, 4]
-  decodeSeq: [4, 500, 500, 500, 75]
+  decodeSeq: [4, 500, 500, 500, 151]
   activation: relu
   decoderActivation: relu
 

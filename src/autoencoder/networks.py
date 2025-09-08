@@ -54,9 +54,6 @@ class AutoEncoder(nn.Module):
         return self.decode(self.encode(x), t)
     
 
-
-
-
 class FCAutoEncoder(AutoEncoder):
     def __init__(self, config:DictConfig):
         super().__init__()
@@ -91,7 +88,7 @@ class ConvAutoEncoder(AutoEncoder):
         padding_mode = config.downblocks.get("padding_mode", 'zeros')
         self.dim = 1 if not (isinstance(in_dims, list) or isinstance(in_dims, ListConfig)) else len(in_dims)
         
-        mlp = config.get("mlp", False)
+        mlp = config.get("mlp", True)
 
         self.encoder = ConvEncoder(
             in_dims=in_dims, 
