@@ -1,9 +1,0 @@
-__object__:
-  path: models
-  name: LTINetHelper
-  args: as_config
-
-recclass: FFNet
-recparams:
-  seq: [4, 800, 800, 800, 1]
-  activation: relu

@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import scipy.io
 import torch
 import warnings
+import h5py
 import ipywidgets as widgets
 import matplotlib as mpl
 
@@ -91,7 +92,7 @@ def determine_params(paramarr):
   P = paramarr.shape[1]
 
   if P == 1:
-    return 0
+    return [0]
 
   for p in range(P):
     if np.abs(paramarr[0, p] - paramarr[1, p]) > 0:
@@ -133,16 +134,17 @@ class DynamicData(torch.utils.data.Dataset):
   def __init__(self, inconfig, seed=0, spacedim=1):
     if isinstance(inconfig, tuple):
       if isinstance(inconfig[0], str):
-        with warnings.catch_warnings():
-          warnings.simplefilter('ignore', MatReadWarning)
-          self.origdata = scipy.io.loadmat(inconfig[0])
+        if inconfig[0][-4:] == ".mat":
+          with warnings.catch_warnings():
+            warnings.simplefilter('ignore', MatReadWarning)
+            self.origdata = scipy.io.loadmat(inconfig[0])
 
-        self.data = self.origdata[inconfig[1]]
+          self.data = self.origdata[inconfig[1]]
 
-        if "params" in self.origdata:
-          self.params = self.origdata["params"]
-        else:
-          self.params = None
+          if "params" in self.origdata:
+            self.params = self.origdata["params"]
+          else:
+            self.params = None
           
       elif isinstance(inconfig[0], np.ndarray):
         self.data = inconfig[0]
@@ -153,18 +155,48 @@ class DynamicData(torch.utils.data.Dataset):
       self.name = None
 
     elif isinstance(inconfig, DictConfig):
-      with warnings.catch_warnings():
-        warnings.simplefilter('ignore', MatReadWarning)
-        self.origdata = scipy.io.loadmat(inconfig.file.filestr)
+      if inconfig.file.filestr[-3:] == ".h5":
+          data_dict = h5py.File(inconfig.file.filestr, "r")
+          outputs = []
+          for key in data_dict.keys():
+            outputs.append(np.asarray(data_dict[key]["data"]).squeeze())
+
+          outputs = np.stack(outputs, axis=0)
+
+          if inconfig.file.name == "shallowradsFULL":
+            def radius_from_dist(outputs, unit_per_pixel=1.0):
+                N = outputs.shape[0]
+                cy = (N - 1) / 2.0
+                cx = (N - 1) / 2.0
+
+                ys, xs = np.nonzero(outputs - 1)
+                d_pixels = np.hypot(ys - cy, xs - cx)
+                # Optional half-pixel boundary correction; comment out if you prefer raw
+                r_pixels = d_pixels.max() + 0.5
+                return r_pixels * unit_per_pixel
+
+            units = 0.03875732421875
+            rads = []
+            for i in range(len(outputs)):
+              rad = radius_from_dist(outputs[i, 0], unit_per_pixel=units)
+              rads.append(rad)
+
+            self.data = outputs
+            self.params = np.asarray(rads)[:, None]
+
+      else:
+        with warnings.catch_warnings():
+          warnings.simplefilter('ignore', MatReadWarning)
+          origdata = scipy.io.loadmat(inconfig.file.filestr)
+
+        self.data = origdata[inconfig.file.dataname]
+
+        if "params" in origdata:
+          self.params = self.origdata["params"]
+        else:
+          self.params = None
 
       self.name = inconfig.file.name
-      self.data = self.origdata[inconfig.file.dataname]
-
-      if "params" in self.origdata:
-        self.params = self.origdata["params"]
-      else:
-        self.params = None
-
       if "datasize" in inconfig:
         if inconfig.datasize.subset:
           self.subset_data(inconfig.datasize.subset)
@@ -178,20 +210,19 @@ class DynamicData(torch.utils.data.Dataset):
         spacedim = inconfig.datasize.spacedim
         newshape = list(self.data.shape[:1+spacedim]) + [-1]
         self.data = self.data.reshape(newshape)
-      
+        
       else:
         spacedim = len(self.data.shape) - 2
 
-    self.data = np.float32(self.data)
-    self.params = np.float32(self.params)
-
+      self.data = np.float32(self.data)
+      
+      self.params = np.float32(self.params)
+    
     if self.params is not None:
       self.params = reduce_params(self.params)
     
     np.random.seed(seed)
     self.shuffle_inplace()
-
-    del self.origdata
     
   def __len__(self):
     return len(self.data)
@@ -554,4 +585,3 @@ def collect_times_dataparams(data, parameters=None):
       params = np.column_stack([np.tile(parameters, (T, 1)), np.repeat(np.arange(0, T), N)])
 
       return collected, params
-  

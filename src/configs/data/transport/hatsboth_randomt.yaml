@@ -1,0 +1,15 @@
+__object__:
+  path: utils
+  name: DynamicData
+  args: as_config
+
+file:
+  filestr: "../../datasets/transport/hats2param_2500_randomt.mat"
+  dataname: "alldata"
+  name: "tbothrandom"
+datasize:
+  subset: 500
+  space: 512
+  time: 51
+  scaledown: True
+  spacedim: 1

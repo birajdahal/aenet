@@ -1,0 +1,15 @@
+__object__:
+  path: utils
+  name: DynamicData
+  args: as_config
+
+file:
+  filestr: "../../datasets/droplet/droplet_trigpoly_3_0.4_0.5.mat"
+  dataname: "alldata"
+  name: "dtrigpolylinear"
+datasize:
+  subset: 500
+  space: 301
+  time: 101
+  scaledown: True
+  spacedim: 1

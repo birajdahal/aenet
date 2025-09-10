@@ -16,3 +16,4 @@ datasets/collection.7z
 .venv
 old/
 raw/
+*.h5

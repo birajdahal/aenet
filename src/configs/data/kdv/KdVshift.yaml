@@ -1,0 +1,15 @@
+__object__:
+  path: utils
+  name: DynamicData
+  args: as_config
+
+file:
+  filestr: "../configs/data/kdv/kdv2-shift.mat"
+  dataname: "kdv2wide"
+  name: "kshift"
+datasize:
+  subset: 500
+  space: 512
+  time: 201
+  scaledown: True
+  spacedim: 1

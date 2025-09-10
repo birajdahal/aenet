@@ -1,0 +1,15 @@
+__object__:
+  path: utils
+  name: DynamicData
+  args: as_config
+
+file:
+  filestr: "../configs/data/shallow/2D_rdb_NA_NA.h5"
+  dataname: "alldata"
+  name: "shallowradsFULL"
+datasize:
+  subset: 1000
+  spacedim: 2
+  space: 64
+  time: 101
+  scaledown: True
