@@ -16,7 +16,7 @@ import seaborn as sns
 import deepxde as dde
 import matplotlib.cm as cm
 import ruptures as rpt
-import torch.multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
 
 from itertools import combinations
 from sklearn.decomposition import PCA
@@ -845,6 +845,8 @@ class WeldNet(WindowTrajectory):
   def get_proj_errors(self, model, testarr, ords=(2,)):
     if isinstance(testarr, np.ndarray):
       testarr = torch.tensor(testarr, dtype=torch.float32)
+
+    testarr = testarr.to(next(model.parameters()).device)
       
     proj = model.decode(self.encode_model(model, testarr))
     
@@ -1198,7 +1200,7 @@ class WeldNet(WindowTrajectory):
         if self.passparams:
           batch = batch[..., :-self.dataset.params.shape[1]]
 
-        self.res = loss(batch, proj)
+        res = loss(batch, proj)
 
         starts = enc[:, :-1]
         exacts = enc[:, 1:]
@@ -1230,9 +1232,9 @@ class WeldNet(WindowTrajectory):
         else:
           predicted = self.prop_forward(modelprop, starts)
 
-        self.error = loss(predicted, exacts)
+        error = loss(predicted, exacts)
 
-        totalloss = self.res + lamb * self.error
+        totalloss = res + lamb * error
 
         totalloss.backward()
         
@@ -1245,6 +1247,7 @@ class WeldNet(WindowTrajectory):
         return totalloss
 
       for batch in dataloader:
+        batch = batch.to(next(model.parameters()).device)
         self.aestep += 1
         lossout = optimizer.step(lambda: closure(batch))
         losses.append(float(lossout.cpu().detach()))
@@ -1257,9 +1260,9 @@ class WeldNet(WindowTrajectory):
         testerr1, testerr2, testerrinf = self.get_proj_errors(model, testarr, ords=(1, 2, np.inf))
 
         if scheduler is not None:
-          print(f"{ep+1}: Train Loss {self.res:.3e} + {self.error:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+          print(f"{w+1}/{ep+1}: Train Loss {lossout:.3e}, LR {scheduler.get_last_lr()[-1]:.3e}, Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
         else:
-          print(f"{ep+1}: Train Loss {self.res:.3e} + {self.error:.3e},, Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+          print(f"{w+1}/{ep+1}: Train Loss {lossout:.3e}, Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
 
         if writer is not None:
             writer.add_scalar("misc/relativeL1proj", testerr1, global_step=ep)
@@ -1267,6 +1270,74 @@ class WeldNet(WindowTrajectory):
             writer.add_scalar("misc/relativeLInfproj", testerrinf, global_step=ep)
 
       return losses, testerrors1, testerrors2, testerrorsinf
+
+    def train_window(w, parallel=False):
+      ae = self.aes[w]
+      prop = self.props[w]
+
+      if parallel:
+        ae.to(f"cuda:{w}")
+        prop.to(f"cuda:{w}")
+
+      losses, testerrors1, testerrors2, testerrorsinf = [], [], [], []
+      bestdict = { "loss": float(np.inf), "ep": 0 }
+
+      self.aestep = 0
+      train = torch.tensor(self.alltrain[:, self.windowvals[w], :], dtype=torch.float32)
+      test = self.alltest[:, self.windowvals[w], :] 
+
+      if isinstance(ae, PCAAutoencoder):
+        ae.train_pca(train.cpu().numpy())
+        testerr1, testerr2, testerrinf = self.get_proj_errors(ae, test, ords=(1, 2, np.inf))
+        print(f"Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+        return
+
+      self.trains.append(train)
+      self.tests.append(test)
+
+      opt = optim( list(ae.parameters()) + list(prop.parameters()), lr=lr, weight_decay=ridge)
+      scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
+      dataloader = DataLoader(train, shuffle=False, batch_size=batch)
+
+      writer = None
+      if self.td is not None:
+        name = f"./tensorboard/{datetime.datetime.now().strftime('%d-%B-%Y')}/{self.td}-weld{w}/{datetime.datetime.now().strftime('%H.%M.%S')}/"
+        writer = torch.utils.tensorboard.SummaryWriter(name)
+        print("Tensorboard writer location is " + name)
+
+      print("Number of NN trainable parameters", utils.num_params(ae))
+      print(f"Starting training WeldNet AE + Prop {w+1}/{self.W} ({self.windowvals[w][0]}->{self.windowvals[w][-1]}) at {time.asctime()}...")
+
+      #print(train, train.shape)
+      print("train", train.shape, "test", test.shape)
+
+      self.aestep = 0
+      for ep in range(epochs):
+          lossesN, testerrors1N, testerrors2N, testerrorsinfN = both_epoch(ae, prop, dataloader, w=w, scheduler=scheduler, optimizer=opt, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test)
+          losses += lossesN; testerrors1 += testerrors1N; testerrors2 += testerrors2N; testerrorsinf += testerrorsinfN
+
+          if best and ep > epochs // 2:
+            avgloss = np.mean(lossesN)
+            if avgloss < bestdict["loss"]:
+              bestdict["model"] = ae.state_dict()
+              bestdict["opt"] = opt.state_dict()
+              bestdict["loss"] = avgloss
+              bestdict["ep"] = ep
+            elif verbose:
+              print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
+
+          if ep % 5 == 0 and plottb:
+            WeldHelper.plot_encoding_window(self, w, encoding_param, step=self.aestep, writer=writer, tensorboard=True)
+      
+      print(f"Finish training AE and Prop {w} at {time.asctime()}.")
+      losses_all.append(losses)
+      testerrors1_all.append(testerrors1)
+      testerrors2_all.append(testerrors2)
+      testerrorsinf_all.append(testerrorsinf)
+
+      if best:
+        ae.load_state_dict(bestdict["model"])
+        opt.load_state_dict(bestdict["opt"])
 
     loss = nn.MSELoss() if loss is None else loss()
     encoding_param = determine_param(self.dataset, encoding_param)
@@ -1282,82 +1353,20 @@ class WeldNet(WindowTrajectory):
     # prepare models
     for w in range(self.W):
       if len(self.aes) <= w:
-        self.aes.append(self.aeclass(**self.aeparams) if self.aeclass not in Other_Modules else self.aeclass(self.aeparams.copy()))
+        self.aes.append(self.aeclass(**self.aeparams).to(self.device) if self.aeclass not in Other_Modules else self.aeclass(self.aeparams.copy()))
       if len(self.props) <= w:
-        self.props.append(self.propclass(**self.propparams) if self.propclass not in Other_Modules else self.propclass(self.propclass.copy()))
+        self.props.append(self.propclass(**self.propparams).to(self.device) if self.propclass not in Other_Modules else self.propclass(self.propclass.copy()))
 
     # train models
-    for ww in range(self.W):
-      def train_window(rank, w):
-        torch.cuda.set_device(rank)
-        ae = self.aes[w]
-        prop = self.props[w]
-
-        losses, testerrors1, testerrors2, testerrorsinf = [], [], [], []
-        bestdict = { "loss": float(np.inf), "ep": 0 }
-
-        self.aestep = 0
-        train = torch.tensor(self.alltrain[:, self.windowvals[w], :], dtype=torch.float32)
-        test = self.alltest[:, self.windowvals[w], :] 
-
-        if isinstance(ae, PCAAutoencoder):
-          ae.train_pca(train.cpu().numpy())
-          testerr1, testerr2, testerrinf = self.get_proj_errors(ae, test, ords=(1, 2, np.inf))
-          print(f"Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
-          return
-
-        self.trains.append(train)
-        self.tests.append(test)
-
-        opt = optim( list(ae.parameters()) + list(prop.parameters()), lr=lr, weight_decay=ridge)
-        scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
-        dataloader = DataLoader(train, shuffle=False, batch_size=batch)
-
-        writer = None
-        if self.td is not None:
-          name = f"./tensorboard/{datetime.datetime.now().strftime('%d-%B-%Y')}/{self.td}-weld{w}/{datetime.datetime.now().strftime('%H.%M.%S')}/"
-          writer = torch.utils.tensorboard.SummaryWriter(name)
-          print("Tensorboard writer location is " + name)
-
-        print("Number of NN trainable parameters", utils.num_params(ae))
-        print(f"Starting training WeldNet AE + Prop {w+1}/{self.W} ({self.windowvals[w][0]}->{self.windowvals[w][-1]}) at {time.asctime()}...")
-
-        #print(train, train.shape)
-        print("train", train.shape, "test", test.shape)
-
-        self.aestep = 0
-        for ep in range(epochs):
-            lossesN, testerrors1N, testerrors2N, testerrorsinfN = both_epoch(ae, prop, dataloader, w=w, scheduler=scheduler, optimizer=opt, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test)
-            losses += lossesN; testerrors1 += testerrors1N; testerrors2 += testerrors2N; testerrorsinf += testerrorsinfN
-
-            if best and ep > epochs // 2:
-              avgloss = np.mean(lossesN)
-              if avgloss < bestdict["loss"]:
-                bestdict["model"] = ae.state_dict()
-                bestdict["opt"] = opt.state_dict()
-                bestdict["loss"] = avgloss
-                bestdict["ep"] = ep
-              elif verbose:
-                print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
-
-            if ep % 5 == 0 and plottb:
-              WeldHelper.plot_encoding_window(self, w, encoding_param, step=self.aestep, writer=writer, tensorboard=True)
-        
-        print(f"Finish training AE and Prop {w} at {time.asctime()}.")
-        losses_all.append(losses)
-        testerrors1_all.append(testerrors1)
-        testerrors2_all.append(testerrors2)
-        testerrorsinf_all.append(testerrorsinf)
-
-        if best:
-          ae.load_state_dict(bestdict["model"])
-          opt.load_state_dict(bestdict["opt"])
-
-      ngpus = torch.cuda.device_count()
-      if self.W > 1 and ngpus >= self.W:
-        mp.spawn(train_window, args=(ww), nprocs=self.W)
-      else:
-        train_window(0, 0)
+    if self.W > 1 and torch.cuda.device_count() >= self.W:
+        print("Spawning threads for each window")
+        with ThreadPoolExecutor(max_workers=self.W) as ex:
+          futures = [ex.submit(train_window, rank, True) for rank in range(self.W)]
+          for f in futures:
+              f.result()
+    else:
+      for ww in range(self.W):
+        train_window(ww)
 
     self.aeepochs.append(epochs)
 
