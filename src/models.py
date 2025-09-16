@@ -16,6 +16,7 @@ import seaborn as sns
 import deepxde as dde
 import matplotlib.cm as cm
 import ruptures as rpt
+import torch.multiprocessing as mp
 
 from itertools import combinations
 from sklearn.decomposition import PCA
@@ -1025,7 +1026,7 @@ class WeldNet(WindowTrajectory):
           error = optimizer.step(lambda: closure(batch))
           losses.append(float(error.cpu().detach()))
 
-        if scheduler is not None:
+        if scheduler is not None and ep > epochs_first // 2:
           scheduler.step(np.mean(losses))
 
         # print test
@@ -1089,7 +1090,7 @@ class WeldNet(WindowTrajectory):
           trainparams = ae.parameters()
 
         opt = optim(trainparams, lr=lr, weight_decay=ridge)
-        scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=20)
+        scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
         dataloader = DataLoader(train, shuffle=False, batch_size=batch)
 
         writer = None
@@ -1248,7 +1249,7 @@ class WeldNet(WindowTrajectory):
         lossout = optimizer.step(lambda: closure(batch))
         losses.append(float(lossout.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -1277,93 +1278,93 @@ class WeldNet(WindowTrajectory):
     print(f"Training {self.W} WeldNet AEs and props together")
     self.trains = []
     self.tests = []
+
+    # prepare models
     for w in range(self.W):
       if len(self.aes) <= w:
         self.aes.append(self.aeclass(**self.aeparams) if self.aeclass not in Other_Modules else self.aeclass(self.aeparams.copy()))
       if len(self.props) <= w:
-        self.props.append(self.propclass(**self.propparams) if self.propclass not in Other_Modules else propclass(propclass.copy()))
+        self.props.append(self.propclass(**self.propparams) if self.propclass not in Other_Modules else self.propclass(self.propclass.copy()))
 
-      ae = self.aes[w]
-      prop = self.props[w]
+    # train models
+    for ww in range(self.W):
+      def train_window(rank, w):
+        torch.cuda.set_device(rank)
+        ae = self.aes[w]
+        prop = self.props[w]
 
-      losses, testerrors1, testerrors2, testerrorsinf = [], [], [], []
-      bestdict = { "loss": float(np.inf), "ep": 0 }
+        losses, testerrors1, testerrors2, testerrorsinf = [], [], [], []
+        bestdict = { "loss": float(np.inf), "ep": 0 }
 
-      self.aestep = 0
-      train = torch.tensor(self.alltrain[:, self.windowvals[w], :], dtype=torch.float32)
-      test = self.alltest[:, self.windowvals[w], :] 
+        self.aestep = 0
+        train = torch.tensor(self.alltrain[:, self.windowvals[w], :], dtype=torch.float32)
+        test = self.alltest[:, self.windowvals[w], :] 
 
-      if isinstance(ae, PCAAutoencoder):
-        ae.train_pca(train.cpu().numpy())
-        testerr1, testerr2, testerrinf = self.get_proj_errors(ae, test, ords=(1, 2, np.inf))
-        print(f"Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+        if isinstance(ae, PCAAutoencoder):
+          ae.train_pca(train.cpu().numpy())
+          testerr1, testerr2, testerrinf = self.get_proj_errors(ae, test, ords=(1, 2, np.inf))
+          print(f"Relative AE Error (1, 2, inf): {testerr1:3f}, {testerr2:3f}, {testerrinf:3f}")
+          return
 
-        continue
+        self.trains.append(train)
+        self.tests.append(test)
 
-      self.trains.append(train)
-      self.tests.append(test)
+        opt = optim( list(ae.parameters()) + list(prop.parameters()), lr=lr, weight_decay=ridge)
+        scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
+        dataloader = DataLoader(train, shuffle=False, batch_size=batch)
 
-      opt = optim( list(ae.parameters()) + list(prop.parameters()), lr=lr, weight_decay=ridge)
-      scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=20)
-      dataloader = DataLoader(train, shuffle=False, batch_size=batch)
+        writer = None
+        if self.td is not None:
+          name = f"./tensorboard/{datetime.datetime.now().strftime('%d-%B-%Y')}/{self.td}-weld{w}/{datetime.datetime.now().strftime('%H.%M.%S')}/"
+          writer = torch.utils.tensorboard.SummaryWriter(name)
+          print("Tensorboard writer location is " + name)
 
-      writer = None
-      if self.td is not None:
-        name = f"./tensorboard/{datetime.datetime.now().strftime('%d-%B-%Y')}/{self.td}-weld{w}/{datetime.datetime.now().strftime('%H.%M.%S')}/"
-        writer = torch.utils.tensorboard.SummaryWriter(name)
-        print("Tensorboard writer location is " + name)
+        print("Number of NN trainable parameters", utils.num_params(ae))
+        print(f"Starting training WeldNet AE + Prop {w+1}/{self.W} ({self.windowvals[w][0]}->{self.windowvals[w][-1]}) at {time.asctime()}...")
 
-      print("Number of NN trainable parameters", utils.num_params(ae))
-      print(f"Starting training WeldNet AE + Prop {w+1}/{self.W} ({self.windowvals[w][0]}->{self.windowvals[w][-1]}) at {time.asctime()}...")
+        #print(train, train.shape)
+        print("train", train.shape, "test", test.shape)
 
-      #print(train, train.shape)
-      print("train", train.shape, "test", test.shape)
+        self.aestep = 0
+        for ep in range(epochs):
+            lossesN, testerrors1N, testerrors2N, testerrorsinfN = both_epoch(ae, prop, dataloader, w=w, scheduler=scheduler, optimizer=opt, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test)
+            losses += lossesN; testerrors1 += testerrors1N; testerrors2 += testerrors2N; testerrorsinf += testerrorsinfN
 
-      self.aestep = 0
-      for ep in range(epochs):
-          lossesN, testerrors1N, testerrors2N, testerrorsinfN = both_epoch(ae, prop, dataloader, w=w, scheduler=scheduler, optimizer=opt, writer=writer, ep=ep, printinterval=printinterval, loss=loss, testarr=test)
-          losses += lossesN; testerrors1 += testerrors1N; testerrors2 += testerrors2N; testerrorsinf += testerrorsinfN
+            if best and ep > epochs // 2:
+              avgloss = np.mean(lossesN)
+              if avgloss < bestdict["loss"]:
+                bestdict["model"] = ae.state_dict()
+                bestdict["opt"] = opt.state_dict()
+                bestdict["loss"] = avgloss
+                bestdict["ep"] = ep
+              elif verbose:
+                print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
 
-          if best and ep > epochs // 2:
-            avgloss = np.mean(lossesN)
-            if avgloss < bestdict["loss"]:
-              bestdict["model"] = ae.state_dict()
-              bestdict["opt"] = opt.state_dict()
-              bestdict["loss"] = avgloss
-              bestdict["ep"] = ep
-            elif verbose:
-              print(f"Loss not improved at epoch {ep} (Ratio: {avgloss/bestdict['loss']:.2f}) from {bestdict['ep']} (Loss: {bestdict['loss']:.2e})")
+            if ep % 5 == 0 and plottb:
+              WeldHelper.plot_encoding_window(self, w, encoding_param, step=self.aestep, writer=writer, tensorboard=True)
+        
+        print(f"Finish training AE and Prop {w} at {time.asctime()}.")
+        losses_all.append(losses)
+        testerrors1_all.append(testerrors1)
+        testerrors2_all.append(testerrors2)
+        testerrorsinf_all.append(testerrorsinf)
 
-          if ep % 5 == 0 and plottb:
-            WeldHelper.plot_encoding_window(self, w, encoding_param, step=self.aestep, writer=writer, tensorboard=True)
-      
-      print(f"Finish training AE and Prop {w} at {time.asctime()}.")
-      losses_all.append(losses)
-      testerrors1_all.append(testerrors1)
-      testerrors2_all.append(testerrors2)
-      testerrorsinf_all.append(testerrorsinf)
+        if best:
+          ae.load_state_dict(bestdict["model"])
+          opt.load_state_dict(bestdict["opt"])
 
-      if best:
-        ae.load_state_dict(bestdict["model"])
-        opt.load_state_dict(bestdict["opt"])
+      ngpus = torch.cuda.device_count()
+      if self.W > 1 and ngpus >= self.W:
+        mp.spawn(train_window, args=(ww), nprocs=self.W)
+      else:
+        train_window(0, 0)
 
     self.aeepochs.append(epochs)
-
-    if save and False:
-      dire = "savedmodels/weld"
-      addr = f"{dire}/{self.prefix}{self.W}w-{datetime.datetime.now().strftime('%d-%B-%Y-%H.%M')}.pickle"
-
-      if not os.path.exists(dire):
-        os.makedirs(dire)
-
-      with open(addr, "wb") as handle:
-        pickle.dump({"aes": self.aes, "aedata": self.aedata, "datadata": self.datadata}, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        print("AEs saved at", addr)
 
     end = time.time()
     self.timetaken += end - start
     print("Finished training all timewindows")
-    return { "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf } 
+    return {}#{ "losses": losses, "testerrors1": testerrors1, "testerrors2": testerrors2, "testerrorsinf": testerrorsinf } 
 
   def train_transcoders(self, epochs, save=True, optim=torch.optim.AdamW, lr=1e-4, verbose=False, propagated_trans=True, printinterval=10, batch=32, ridge=0, loss=None, encoding_param=-1, best=True):
     def transcoder_epoch(model, dataloader, writer=None, scheduler=None, optimizer=None, ep=0, printinterval=10, loss=None, testarr=None):
@@ -1401,7 +1402,7 @@ class WeldNet(WindowTrajectory):
         error = optimizer.step(lambda: closure(batch))
         losses.append(float(error.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -1484,7 +1485,7 @@ class WeldNet(WindowTrajectory):
 
       trans = self.transcoders[w]
       opt = optim(trans.parameters(), lr=lr, weight_decay=ridge)
-      scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=20, factor=0.3)
+      scheduler = lr_scheduler.ReduceLROnPlateau(opt, patience=30, factor=0.3)
 
       dataloader = DataLoader(train, shuffle=False, batch_size=batch)
 
@@ -1700,7 +1701,7 @@ class WeldNet(WindowTrajectory):
           if self.propstep % 5 == 0:
             writer.add_scalar("propagator/loss", float(error), global_step=self.propstep)
 
-      if scheduler is not None:
+      if scheduler is not None and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -2137,7 +2138,7 @@ class NewTimeInputModel():
         error = optimizer.step(lambda: closure(batch))
         losses.append(float(error.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -2689,7 +2690,7 @@ class TimeInputModel():
         error = optimizer.step(lambda: closure(batch))
         losses.append(float(error.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -4276,7 +4277,7 @@ class LDNet():
         error = optimizer.step(lambda: closure(values, params))
         losses.append(float(error.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -4710,7 +4711,7 @@ class LTINet():
         error = optimizer.step(lambda: closure(values, params))
         losses.append(float(error.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None  and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -5187,7 +5188,7 @@ class ETINet():
         error = optimizer.step(lambda: closure(codes, rest))
         losses.append(float(error.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None  and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -5323,7 +5324,7 @@ class ETINet():
         error = optimizer.step(lambda: closure(codes))
         losses.append(float(error.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -5777,7 +5778,7 @@ class ELDNet():
         error = optimizer.step(lambda: closure(codes))
         losses.append(float(error.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -5872,7 +5873,7 @@ class ELDNet():
         error = optimizer.step(lambda: closure(values, params))
         losses.append(float(error.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test
@@ -6179,7 +6180,7 @@ class HighDimProp():
         error = optimizer.step(lambda: closure(batch))
         losses.append(float(error.cpu().detach()))
 
-      if scheduler is not None:
+      if scheduler is not None and ep > epochs // 2:
         scheduler.step(np.mean(losses))
 
       # print test

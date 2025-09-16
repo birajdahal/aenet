@@ -192,7 +192,7 @@ class DynamicData(torch.utils.data.Dataset):
         self.data = origdata[inconfig.file.dataname]
 
         if "params" in origdata:
-          self.params = self.origdata["params"]
+          self.params = origdata["params"]
         else:
           self.params = None
 
@@ -294,7 +294,7 @@ class DynamicData(torch.utils.data.Dataset):
     else:
       return data
 
-  def plot_svd(self, title="", dpi=80, t=0, maxnum=-1):
+  def plot_svd(self, title="", dpi=80, t=-1, maxnum=-1):
     if t >= 0:
       arr = self.data[:, t]
       arr = self.data.reshape(list(self.data.shape[:2]) + [-1])

@@ -104,9 +104,9 @@ class ConvEncoder(coder):
                     actvn
                 ) for i, ksp in enumerate(kernel_stride_paddings)],
                 nn.Flatten(),
-                nn.Linear(out_channels[-1]*prod(self.conv_layers_config[-1]["out_dims"]), 256),
+                nn.Linear(out_channels[-1]*prod(self.conv_layers_config[-1]["out_dims"]), 256 if self.dim == 1 else 512),
                 actvn,
-                nn.Linear(256, latents_dims)
+                nn.Linear(256 if self.dim == 1 else 512, latents_dims)
             )
         else:
             self.blocks = nn.Sequential(
@@ -144,9 +144,9 @@ class ConvDecoder(coder):
 
         if mlp:
             self.blocks = nn.Sequential(
-                nn.Linear(latents_dims, 256),
+                nn.Linear(latents_dims, 256 if self.dim == 1 else 512),
                 actvn,
-                nn.Linear(256, in_channels[0]*prod(self.tconv_layers_config[0]["in_dims"])),
+                nn.Linear(256 if self.dim == 1 else 512, in_channels[0]*prod(self.tconv_layers_config[0]["in_dims"])),
                 nn.Unflatten(1, (in_channels[0], *self.tconv_layers_config[0]["in_dims"])),
                 *[nn.Sequential(
                     actvn,
